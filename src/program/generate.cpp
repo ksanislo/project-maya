@@ -1200,10 +1200,7 @@ static int glm_pack_generate(const Options& o) {
                         std::lock_guard<std::mutex> lk(ctl_mu);
                         ctl[rid] = c0 == "STOP" ? 1 : kw == "keep" ? 3 : 2;
                     }
-                    if (rid == admitting_rid.load()) {
-                        admit_stop.store(true);
-                        if (interleave.tokens == 0 && read_gaps.percent == 0) stop_req.store(true);
-                    }
+                    if (rid == admitting_rid.load()) admit_stop.store(true);
                     continue;
                 }
                 if (l == "PAUSE" || l == "PAUSE keep") {   // keep: the prompt's state is set aside first
@@ -2706,12 +2703,14 @@ static int glm_pack_generate(const Options& o) {
         }
         return true;
     };
-    // an engine error in the middle: every running request gets it, the sequences are reset
+    // an engine error in the middle: every running request gets it, their sequences are reset (an idle context's
+    // conversation was not written meanwhile and stays reusable)
     uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: STRATA_GLM_PREFILL_INTERLEAVE)
     std::string multi_fail_why;
     const auto multi_fail = [&](const std::string& why) {
         ++multi_fails;
         multi_fail_why = why;
+        std::vector<int> failed;
         for (auto& gp : gens) {
             if (gp->done) continue;
             if (why.find("non-finite") != std::string::npos)   // the slots it may have come from (drop_if_poisoned)
@@ -2722,6 +2721,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             std::printf("ERR %d %s\n", gp->rid, why.c_str());
             ctxs[(size_t) gp->ctx].busy = false;
+            failed.push_back(gp->ctx);
             gp->done = true;
         }
         flight.clear();
@@ -2733,9 +2733,12 @@ static int glm_pack_generate(const Options& o) {
             gen_sweep();
             return;
         }
-        for (const auto& d : deferred_pauses) ctxs[(size_t) d.ctx].busy = false;   // (their states go with the rest)
+        for (const auto& d : deferred_pauses) {   // (a pause not kept yet: its state goes with the failed ones)
+            ctxs[(size_t) d.ctx].busy = false;
+            failed.push_back(d.ctx);
+        }
         deferred_pauses.clear();
-        for (int c = 0; c < (int) ctxs.size(); ++c) {
+        for (const int c : failed) {
             bind_ctx(c);
             snap_tokens.clear();
             model.reset();
@@ -2918,9 +2921,8 @@ static int glm_pack_generate(const Options& o) {
             ctl.erase(rid);
             return;
         }
-        // a STOP <rid> during its prompt (with interleave: admit_stop alone)
-        const bool stopped_all = stop_req.exchange(false), stopped_this = admit_stop.exchange(false);
-        if (stopped_all || stopped_this) g->finish = "cancel";
+        // a STOP <rid> during its prompt (admit_stop); a bare STOP stays set and also ends the running requests
+        if (admit_stop.exchange(false) || stop_req.load()) g->finish = "cancel";
         g->t1 = std::chrono::steady_clock::now();
         g->st1 = model.fast_stats();
         g->spec_steps0 = model.spec_steps_;
