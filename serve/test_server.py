@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sys
@@ -897,7 +898,6 @@ class LiveRateBursts(unittest.TestCase):
 
     def test_bursty_tokens_read_near_the_true_rate(self):
         import random
-        import serve.server as srv
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         rnd = random.Random(7)
@@ -909,16 +909,11 @@ class LiveRateBursts(unittest.TestCase):
                 samples.append((t, n))
         true_rate = n / (t - 1000.0)
         reads = []
-        for now in (1004.0, 1006.0, 1008.0, 1010.0, 1012.0):
-            svc.status.update(busy=True, first_token=1000.0, generated=n)
-            svc.rate.clear()
-            svc.rate.extend(s for s in samples if s[0] <= now)
-            orig = srv.time.time
-            srv.time.time = lambda: now
-            try:
-                reads.append(svc._tok_s())
-            finally:
-                srv.time.time = orig
+        for now in (1004.0, 1006.0, 1008.0, 1010.0, 1012.0):   # (a request's own record: its rate window)
+            got = [s for s in samples if s[0] <= now]
+            rec = {"first_token": 1000.0, "generated": got[-1][1], "queued": False,
+                   "rate": collections.deque(got, maxlen=4096)}
+            reads.append(svc._rate_of(rec, now))
         for r in reads:
             self.assertLess(abs(r - true_rate) / true_rate, 0.15, (reads, true_rate))
 
@@ -984,6 +979,31 @@ class LiveRate(unittest.TestCase):
         list(gen)
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
+
+    def test_a_prompt_read_beside_an_answer(self):
+        # several requests at once: one answers while another reads its prompt - the Monitor shows the reading one's
+        # progress and rate (from its own record), not nothing
+        now = time.time()
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True
+            self.svc.live[901] = {"key": 901, "phase": "answering", "generated": 50, "started": now - 30,
+                                  "first_token": now - 20, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque([(now - 1, 40), (now, 50)], maxlen=32)}
+            self.svc.live[902] = {"key": 902, "phase": "reading the prompt", "generated": 0, "started": now - 5,
+                                  "first_token": None, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque(maxlen=32), "prompt_read": 4096, "prompt_total": 9000,
+                                  "prefill_tok_s": 431.0}
+        try:
+            live = self.metrics()["live"]
+            self.assertEqual(live["state"], "generating")
+            self.assertEqual((live["prompt_read"], live["prompt_total"]), (4096, 9000))
+            self.assertEqual(live["prefill_tok_s_mean"], 431.0)
+            self.assertEqual(self.svc._prefill_tok_s_mean(), 431.0)
+        finally:
+            with self.svc.status_lock:
+                self.svc.live.pop(901, None)
+                self.svc.live.pop(902, None)
+                self.svc.status["busy"] = False
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
