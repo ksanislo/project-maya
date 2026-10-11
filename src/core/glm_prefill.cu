@@ -639,7 +639,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
         stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
     }
     const int64_t keep = g.n_exp_used + gf::kSpares + 2;
-    const size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
+    const size_t el_keep = el_budget_ - std::min(el_budget_, el_backed_);   // (elastic contexts' budget stays free)
+    const size_t avail =
+        part_budget(dev_free > el_keep ? dev_free - el_keep : 0, dev_total, (size_t) keep * stride_sum, stride_max).avail;
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
@@ -1093,6 +1095,19 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
 bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
     FastState* F = fast_;
+    // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
+    return lend_slots([F, limit](int il, int s) {
+        const auto& P = F->lp[(size_t) il];
+        return s >= P.n_main && P.slot_ptr(s) < F->xpool + limit;
+    }, moved, dropped, err);
+}
+
+// Lend the slots `sel` picks (every layer's): their experts move over colder ones outside the selection (a device
+// copy) or go to the RAM tier (else to disk), spares there leave the spare table, and they become kLent - the tail
+// for a prompt (lend_tail), the top of a layer for an elastic context (pool_give)
+bool Glm5Model::lend_slots(const std::function<bool(int, int)>& sel, uint64_t& moved, uint64_t& dropped,
+                           std::string& err) {
+    FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
     F->bg_hold = true;
@@ -1184,15 +1199,14 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             std::vector<std::pair<uint64_t, int>> cold;   // (count << 32 | recency rank, slot)
             if (!lend_drop)
                 for (int s = 0; s < P.n_main; ++s)
-                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0)
+                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0 && !sel(il, s))
                         cold.push_back({(uint64_t) F->cnt[(size_t) il * NE + P.key[(size_t) s]], s});
             std::sort(cold.begin(), cold.end(), [&](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
             });
             size_t ci = 0;
-            for (int s = P.n_main; s < P.n; ++s) {
-                // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+            for (int s = 0; s < P.n; ++s) {
+                if (!sel(il, s)) continue;
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
@@ -1330,6 +1344,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     PrefillState* S = pf_;
     const Glm5Geometry& g = g_;
     const cudaStream_t s = F->cs;
+    if (!el_.empty() && !seq_grow(seq_index(), p0 + T, err)) return false;   // elastic: the chunk backed
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
 
@@ -3158,6 +3173,9 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
     const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
                                             : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    // elastic: the whole prompt backed before it is read
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (!m->el_.empty() && !m->seq_grow(m->seq_index(), m->pos_ + nn, err)) return false;
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
