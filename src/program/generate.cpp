@@ -1130,6 +1130,7 @@ static int glm_pack_generate(const Options& o) {
     // in the same decode
     int64_t req_think_budget = 0;
     int32_t req_think_end = -1;
+    int64_t req_cp = 0;   // GEN cp=<n>: the prompt's first n tokens are its system part (a shared checkpoint)
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -1154,6 +1155,7 @@ static int glm_pack_generate(const Options& o) {
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
+        bool shared = false;   // a system prompt's checkpoint: other conversations start from it, it is never superseded
     };
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
@@ -1192,7 +1194,9 @@ static int glm_pack_generate(const Options& o) {
     }();
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
+    // (after the closing magic, one byte of flags: 1 = a shared checkpoint; older engines stop reading before it)
+    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
+                                bool shared = false) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -1204,6 +1208,8 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) &nt, 8);
             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
             f.write((const char*) &kMetaMagic, 8);
+            const uint8_t flags = shared ? 1 : 0;
+            f.write((const char*) &flags, 1);
             f.flush();
             if (!f) return false;
         }
@@ -1212,7 +1218,8 @@ static int glm_pack_generate(const Options& o) {
         return !ec;
     };
     // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
+    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
+                               bool* shared = nullptr) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
@@ -1221,8 +1228,12 @@ static int glm_pack_generate(const Options& o) {
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
         toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
-               m1 == kMetaMagic;
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &m1, 8) ||
+            m1 != kMetaMagic)
+            return false;
+        uint8_t flags = 0;
+        if (shared != nullptr) *shared = f.read((char*) &flags, 1) && (flags & 1);
+        return true;
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -1245,7 +1256,7 @@ static int glm_pack_generate(const Options& o) {
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
-        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; };
+        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; bool shared; };
         std::vector<Found> found;
         size_t refused = 0;
         for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
@@ -1259,9 +1270,9 @@ static int glm_pack_generate(const Options& o) {
             }
             if (!is_meta) continue;                      // a .bin is judged by its .meta
             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
+            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec), false};
             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+            if (meta_read(p, fd.toks, fd.bytes, &fd.shared) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
                 found.push_back(std::move(fd));
             } else {
                 ++refused;
@@ -1281,6 +1292,7 @@ static int glm_pack_generate(const Options& o) {
         for (auto& fd : found) {
             total += fd.bytes;
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
+            slots.back().shared = fd.shared;
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1311,7 +1323,7 @@ static int glm_pack_generate(const Options& o) {
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (!slots[i].anchor && slots[i].tokens.size() <= snap_tokens.size() &&
+            if (!slots[i].anchor && !slots[i].shared && slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
@@ -1482,6 +1494,30 @@ static int glm_pack_generate(const Options& o) {
             model.reset();
         }
     };
+    // PREFIX CHECKPOINTS: a prompt whose system part (GEN cp=<n>, the server's) no slot holds yet is read in two
+    // steps, and the state between them goes to a shared slot - the next conversation with the same system prompt (an
+    // agent's other sessions and helpers) takes it back instead of reading it
+    const auto cp_wanted = [&](const std::vector<int32_t>& prompt, size_t reuse, int64_t cp) -> bool {
+        if (slot_max <= 0 || !model.fast() || cp <= (int64_t) reuse || cp < std::max<int64_t>(1024, (int64_t) slot_min) ||
+            cp >= (int64_t) prompt.size() - 1 || img_hash((size_t) cp) != kNoImages)
+            return false;
+        for (const auto& sl : slots)
+            if (sl.tokens.size() >= (size_t) cp && std::equal(prompt.begin(), prompt.begin() + cp, sl.tokens.begin()))
+                return false;
+        return true;
+    };
+    const auto cp_save = [&](const std::vector<int32_t>& prompt, int64_t cp) {
+        if (!model.snapshot_save()) return;
+        snap_tokens.assign(prompt.begin(), prompt.begin() + cp);
+        snap_img_hash = kNoImages;
+        snap_in_slot = false;
+        slot_put(" (a system prompt other conversations can start from)");
+        for (auto& sl : slots)
+            if (sl.tokens == snap_tokens && !sl.shared) {
+                sl.shared = true;
+                meta_write(meta_of(sl.path), sl.tokens, sl.bytes, true);   // (a restart keeps it shared)
+            }
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         reuse = prep_restore(prompt);
@@ -1510,11 +1546,27 @@ static int glm_pack_generate(const Options& o) {
                 pp_line((size_t) done);
                 return !stop_req.load() && !admit_stop.load();
             };
-            const bool pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
+            bool pok = true;
+            if (cp_wanted(prompt, reuse, req_cp)) {   // the system part first, then its checkpoint
+                const std::vector<int32_t> head(prompt.begin() + (long) reuse, prompt.begin() + req_cp);
+                pok = model.prefill(head, err, prompt[(size_t) req_cp]);
+                if (pok) {
+                    cp_save(prompt, req_cp);
+                    i_first = (size_t) req_cp;   // (a rest too short for the prompt path: the token path from here)
+                    part.assign(prompt.begin() + req_cp, prompt.end() - 1);
+                    const size_t base = (size_t) req_cp - reuse;
+                    model.prefill_progress = [&, base](int64_t done, int64_t total) {
+                        (void) total;
+                        pp_line(base + (size_t) done);
+                        return !stop_req.load() && !admit_stop.load();
+                    };
+                }
+            }
+            if (pok) pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
             model.prefill_progress = nullptr;
             if (pok) {
                 i_first = prompt.size() - 1;
-                pp_line(part.size());
+                pp_line(prompt.size() - 1 - reuse);
             } else if (err == "cancelled") {
                 keep_partial(prompt, reuse);
                 finish = "cancel";
@@ -1834,6 +1886,7 @@ static int glm_pack_generate(const Options& o) {
         bool inflight = false, done = false, pause = false, keep = false;
         bool images = false;     // its prompt had pictures
         bool reading = false;    // its prompt is being read beside the decode (the Reader)
+        int64_t cp = 0;          // its system part's end (GEN cp)
         const char* finish = "length";
         size_t reuse = 0;
         std::chrono::steady_clock::time_point t0, t1;
@@ -1854,6 +1907,8 @@ static int glm_pack_generate(const Options& o) {
         bool ok = false;
         std::string err;
         std::vector<int32_t> part;
+        size_t from = 0;      // the prompt token the part starts at
+        int64_t cp = 0;       // > 0: the part ends at the system part's end - its checkpoint, then the rest
     };
     std::unique_ptr<Reader> reader;
     static const bool prefill_fg = env_num("STRATA_GLM_PREFILL_FG", 0) != 0;
@@ -1881,6 +1936,7 @@ static int glm_pack_generate(const Options& o) {
         int32_t think_end;
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
+        int64_t cp = 0;
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
@@ -2188,6 +2244,37 @@ static int glm_pack_generate(const Options& o) {
         if (gens.size() > 1 && !resolve_ready()) multi_fail(err);   // the others decode: its first token now
         gen_sweep();
     };
+    // the prompt's tokens [from, to) on the Reader (prefill_begin's background), the token after them `next`; cp > 0:
+    // `to` is the system part's end.  false: no prompt path for them (err set: an error)
+    const auto reader_start = [&](Gen* gp, size_t from, size_t to, int64_t cp) -> bool {
+        std::vector<int32_t> part(gp->prompt.begin() + (long) from, gp->prompt.begin() + (long) to);
+        if (!model.prefill_begin((int64_t) part.size(), gp->prompt[to], true, err)) return false;
+        reader = std::make_unique<Reader>();
+        Reader* R = reader.get();
+        R->part = std::move(part);
+        R->g = gp;
+        R->from = from;
+        R->cp = cp;
+        gp->reading = true;
+        const std::string rtag = std::to_string(gp->rid) + " ";
+        const auto rt0 = gp->t0;
+        const size_t rtotal = gp->prompt.size(), rfrom = from, rreuse = gp->reuse;
+        model.prefill_progress = [&, rtag, rt0, rtotal, rfrom, rreuse](int64_t done, int64_t total) {
+            (void) total;
+            if (o.serve) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt0).count();
+                std::printf("PP %s%zu %zu %.1f %.1f\n", rtag.c_str(), rfrom + (size_t) done, rtotal, ms,
+                            (double) (rfrom - rreuse + (size_t) done) / (ms / 1000.0 + 1e-9));
+                std::fflush(stdout);
+            }
+            return !stop_req.load() && !admit_stop.load();
+        };
+        R->th = std::thread([&model, R] {
+            R->ok = model.prefill_run(R->part, R->err);
+            R->done.store(true, std::memory_order_release);
+        });
+        return true;
+    };
     // the Reader is done: the decode drains (the token path and the snapshot use the shared streams and buffers), the
     // tail goes back, then the prompt's last token and the request's first
     const auto reader_finish = [&] {
@@ -2200,7 +2287,9 @@ static int glm_pack_generate(const Options& o) {
         const bool fok = model.prefill_finish(fe);
         admitting_rid.store(-1);
         std::string e = !R->ok ? R->err : !fok ? fe : std::string();
-        const size_t n_part = R->part.size();
+        const size_t n_part = R->from + R->part.size() - g.reuse;
+        const int64_t cp_at = R->cp;
+        size_t tail_from = g.prompt.size() - 1;
         g.reading = false;
         reader.reset();
         if (!drained) {
@@ -2208,6 +2297,14 @@ static int glm_pack_generate(const Options& o) {
             return;
         }
         bind_ctx(g.ctx);
+        if (e.empty() && cp_at > 0) {   // the system part is read: its checkpoint, then the rest on the Reader
+            cp_save(g.prompt, cp_at);
+            admitting_rid.store(g.rid);
+            if (reader_start(&g, (size_t) cp_at, g.prompt.size() - 1, 0)) return;
+            admitting_rid.store(-1);
+            if (!err.empty()) e = err;
+            else tail_from = (size_t) cp_at;   // (a rest too short for the prompt path: the token path from there)
+        }
         tag = std::to_string(g.rid) + " ";
         int rc = 0;
         if (e == "cancelled") {
@@ -2225,7 +2322,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("PP %s%zu %zu %.1f %.1f\n", tag.c_str(), g.reuse + n_part, g.prompt.size(), ms,
                             (double) n_part / (ms / 1000.0 + 1e-9));
             }
-            rc = prep_tail(g.prompt, g.prompt.size() - 1, g.reuse, g.finish, g.t0);
+            rc = prep_tail(g.prompt, tail_from, g.reuse, g.finish, g.t0);
         }
         tag.clear();
         if (rc != 0) {
@@ -2239,7 +2336,7 @@ static int glm_pack_generate(const Options& o) {
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
         if (reader) {   // one prompt read at a time: this one waits for it
-            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows});
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows, req_cp});
             return;
         }
         if (!multi_drain() || !resolve_ready()) {
@@ -2293,7 +2390,7 @@ static int glm_pack_generate(const Options& o) {
                             g->prompt.size());
                 return;
             }
-            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows});
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows, req_cp});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
@@ -2326,31 +2423,9 @@ static int glm_pack_generate(const Options& o) {
             g->t0 = std::chrono::steady_clock::now();
             size_t i_first = g->reuse;
             if (model.prefill_chunk() > 0 && g->prompt.size() - g->reuse > 1) {
-                std::vector<int32_t> part(g->prompt.begin() + (long) g->reuse, g->prompt.end() - 1);
-                if (model.prefill_begin((int64_t) part.size(), g->prompt.back(), true, err)) {
-                    reader = std::make_unique<Reader>();
-                    Reader* R = reader.get();
-                    R->part = std::move(part);
-                    R->g = g.get();
-                    g->reading = true;
-                    const std::string rtag = tag;
-                    const auto rt0 = g->t0;
-                    const size_t rreuse = g->reuse, rtotal = g->prompt.size();
-                    model.prefill_progress = [&, rtag, rt0, rreuse, rtotal](int64_t done, int64_t total) {
-                        (void) total;
-                        if (o.serve) {
-                            const double ms =
-                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt0).count();
-                            std::printf("PP %s%zu %zu %.1f %.1f\n", rtag.c_str(), rreuse + (size_t) done, rtotal, ms,
-                                        (double) done / (ms / 1000.0 + 1e-9));
-                            std::fflush(stdout);
-                        }
-                        return !stop_req.load() && !admit_stop.load();
-                    };
-                    R->th = std::thread([&model, R] {
-                        R->ok = model.prefill_run(R->part, R->err);
-                        R->done.store(true, std::memory_order_release);
-                    });
+                g->cp = req_cp;
+                const bool cpw = cp_wanted(g->prompt, g->reuse, g->cp);
+                if (reader_start(g.get(), g->reuse, cpw ? (size_t) g->cp : g->prompt.size() - 1, cpw ? g->cp : 0)) {
                     tag.clear();
                     gens.push_back(std::move(g));
                     std::fprintf(stderr, "glm multi: request %d reads %zu prompt tokens beside %zu decoding\n", rid,
@@ -2409,6 +2484,7 @@ static int glm_pack_generate(const Options& o) {
             pending.erase(pending.begin() + (long) i);
             req_think_budget = w2.think_budget;
             req_think_end = w2.think_end;
+            req_cp = w2.cp;
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -3002,6 +3078,7 @@ static int glm_pack_generate(const Options& o) {
             bool any_key = false, greedy_req = false;
             req_think_budget = 0;
             req_think_end = -1;
+            req_cp = 0;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
             int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
@@ -3030,6 +3107,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
+                else if (k == "cp") { req_cp = std::atoll(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "read_chunks") { req_chunks = std::atoi(v.c_str()); }

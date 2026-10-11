@@ -382,6 +382,64 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class PrefixCheckpoint(unittest.TestCase):
+    """GEN cp=<n>: where a prompt's system part (the leading system messages and the tools) ends, when its tokens are a
+    prefix of the prompt's - the engine keeps a shared slot there."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+        cls.tmpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok, cls.tmpl)
+
+    def cp(self, msgs, tools=None):
+        kw = {}
+        ids, _, _ = self.svc.prepare(msgs, tools, kw)
+        return kw.get("_checkpoint"), ids
+
+    def test_key(self):
+        self.assertIn("cp=1500", StrataEngine.sampling_keys({"temperature": 0, "_checkpoint": 1500}).split())
+        self.assertIn("cp=1500", StrataEngine.sampling_keys({"temperature": 0.7, "_checkpoint": 1500}).split())
+        for bad in (0, -1, True, 2.5, "1500", None):
+            self.assertFalse([k for k in StrataEngine.sampling_keys({"_checkpoint": bad}).split() if k.startswith("cp=")],
+                             bad)
+
+    def test_system_part(self):
+        sysm = {"role": "system", "content": "You are a careful agent. " * 20}
+        n, ids = self.cp([sysm, {"role": "user", "content": "task one"}])
+        alone = self.tok.encode(self.tmpl.render([sysm], add_generation_prompt=False), parse_special=True)
+        self.assertEqual(n, len(alone))
+        self.assertEqual(ids[:n], alone)
+        n2, _ = self.cp([sysm, {"role": "user", "content": "another task"}])
+        self.assertEqual(n2, n)                          # the same system prompt: the same checkpoint
+
+    def test_none(self):
+        self.assertEqual(self.cp([{"role": "user", "content": "no system part"}])[0], 0)
+        self.assertEqual(self.cp([{"role": "system", "content": "only a system part"}])[0], 0)
+
+    def test_reaches_the_engine(self):
+        seen = {}
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                seen.update(sampling or {})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        svc = Service(Recording(self.tok, "ok", max_context=CTX), self.tok, self.tmpl)
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 4, "messages": [{"role": "system", "content": "rules " * 50},
+                                                                 {"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertGreater(seen.get("_checkpoint", 0), 0)
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
