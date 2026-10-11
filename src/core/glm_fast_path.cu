@@ -586,7 +586,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->ram_resident = getenv("STRATA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("STRATA_GLM_RAM_RESIDENT")) != 0;
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
-    if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
+    // several conversations at once: the decode's stream before the prompt's (which a prompt beside it reads on)
+    int pr_least = 0, pr_greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&pr_least, &pr_greatest);
+    const char* seqs_env = getenv("STRATA_GLM_SEQS");
+    const int cs_prio = seqs_env != nullptr && std::atoi(seqs_env) > 1 ? pr_greatest : pr_least;
+    if (cudaStreamCreateWithPriority(&F->cs, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
@@ -3777,6 +3782,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+    // a prompt beside the decode: no plan of its between choosing experts and queuing their work, and that work done
+    std::unique_lock<std::mutex> plan_lk(F->plan_mu, std::defer_lock);
+    if (F->pf_bg.load(std::memory_order_acquire)) {
+        plan_lk.lock();
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->pf_cs), "glm boundary prompt", err) ||
+            !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm boundary prompt copies", err))
+            return false;
+    }
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
