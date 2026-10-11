@@ -1043,6 +1043,7 @@ static int glm_pack_generate(const Options& o) {
     std::mutex ctl_mu;
     std::map<int, int> ctl;   // rid -> 1 STOP, 2 PAUSE, 3 PAUSE keep
     std::atomic<int> admitting_rid{-1};
+    std::atomic<bool> admit_stop{false};   // a STOP/PAUSE <rid> for the request whose prompt is being read
     std::mutex in_mu;
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
@@ -1086,7 +1087,7 @@ static int glm_pack_generate(const Options& o) {
                         std::lock_guard<std::mutex> lk(ctl_mu);
                         ctl[rid] = c0 == "STOP" ? 1 : kw == "keep" ? 3 : 2;
                     }
-                    if (rid == admitting_rid.load()) stop_req.store(true);
+                    if (rid == admitting_rid.load()) admit_stop.store(true);
                     continue;
                 }
                 if (l == "PAUSE" || l == "PAUSE keep") {   // keep: the prompt's state is set aside first
@@ -1449,7 +1450,7 @@ static int glm_pack_generate(const Options& o) {
             model.prefill_progress = [&](int64_t done, int64_t total) {
                 (void) total;
                 pp_line((size_t) done);
-                return !stop_req.load();
+                return !stop_req.load() && !admit_stop.load();
             };
             const bool pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
             model.prefill_progress = nullptr;
@@ -1495,7 +1496,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("PP %s%zu %zu %.1f %.1f\n", tag.c_str(), i, prompt.size(), ms,
                             (double) (i - reuse) / (ms / 1000.0 + 1e-9));
             }
-            if (stop_req.load()) { finish = "cancel"; break; }
+            if (stop_req.load() || admit_stop.load()) { finish = "cancel"; break; }
         }
         return 0;
     };
@@ -2013,16 +2014,19 @@ static int glm_pack_generate(const Options& o) {
         }
         return true;
     };
-    // an engine error in the middle: every running request gets it, the sequences are reset
+    // an engine error in the middle: every running request gets it, their sequences are reset (an idle context's
+    // conversation was not written meanwhile and stays reusable)
     const auto multi_fail = [&](const std::string& why) {
+        std::vector<int> failed;
         for (auto& gp : gens) {
             if (gp->done) continue;
             std::printf("ERR %d %s\n", gp->rid, why.c_str());
             ctxs[(size_t) gp->ctx].busy = false;
+            failed.push_back(gp->ctx);
             gp->done = true;
         }
         flight.clear();
-        for (int c = 0; c < (int) ctxs.size(); ++c) {
+        for (const int c : failed) {
             bind_ctx(c);
             snap_tokens.clear();
             model.reset();
@@ -2095,6 +2099,7 @@ static int glm_pack_generate(const Options& o) {
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
         tag = std::to_string(rid) + " ";
+        admit_stop.store(false);
         admitting_rid.store(rid);
         const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
         admitting_rid.store(-1);
@@ -2103,7 +2108,8 @@ static int glm_pack_generate(const Options& o) {
             ctxs[(size_t) best].busy = false;
             return;
         }
-        if (stop_req.exchange(false)) g->finish = "cancel";   // a STOP <rid> during its prompt
+        // a STOP <rid> during its prompt; a bare STOP stays set and also ends the running requests
+        if (admit_stop.exchange(false) || stop_req.load()) g->finish = "cancel";
         g->t1 = std::chrono::steady_clock::now();
         g->st1 = model.fast_stats();
         g->spec_steps0 = model.spec_steps_;
