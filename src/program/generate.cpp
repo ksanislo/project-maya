@@ -1466,6 +1466,22 @@ static int glm_pack_generate(const Options& o) {
         }
         return 0;
     };
+    // a prompt cancelled while it was read: the state stands at a chunk boundary (the prompt path stops every part
+    // at the same one) - kept as the conversation's snapshot, so the request that follows (a retry, the next turn)
+    // reads only the rest; nothing read past what was restored: the restored conversation stays as it was
+    const auto keep_partial = [&](const std::vector<int32_t>& prompt, size_t reuse) {
+        const int64_t at = model.position();
+        if (model.fast() && at > (int64_t) reuse && at < (int64_t) prompt.size() && model.snapshot_save()) {
+            snap_tokens.assign(prompt.begin(), prompt.begin() + at);
+            snap_img_hash = img_hash(snap_tokens.size());
+            snap_in_slot = false;
+            std::fprintf(stderr, "glm slots: a cancelled prompt keeps the %lld tokens it read (%zu new)\n",
+                         (long long) at, (size_t) at - reuse);
+        } else if (!(at == (int64_t) reuse && reuse > 0)) {
+            snap_tokens.clear();
+            model.reset();
+        }
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         reuse = prep_restore(prompt);
@@ -1500,8 +1516,7 @@ static int glm_pack_generate(const Options& o) {
                 i_first = prompt.size() - 1;
                 pp_line(part.size());
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
+                keep_partial(prompt, reuse);
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
@@ -2121,8 +2136,7 @@ static int glm_pack_generate(const Options& o) {
         tag = std::to_string(g.rid) + " ";
         int rc = 0;
         if (e == "cancelled") {
-            snap_tokens.clear();
-            model.reset();
+            keep_partial(g.prompt, g.reuse);
             g.finish = "cancel";
             std::fprintf(stderr, "glm multi: request %d's prompt cancelled while it was read\n", g.rid);
         } else if (!e.empty()) {
