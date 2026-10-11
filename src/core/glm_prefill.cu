@@ -610,7 +610,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
     cudaMemGetInfo(&dev_free, &dev_total);
-    const size_t avail = pool_avail(dev_free, dev_total);
+    const size_t el_keep = el_budget_ - std::min(el_budget_, el_backed_);   // (elastic contexts' budget stays free)
+    const size_t avail = pool_avail(dev_free > el_keep ? dev_free - el_keep : 0, dev_total);
     size_t blob_sum = 0, stride_sum = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -1033,6 +1034,19 @@ bool Glm5Model::vision_reclaim(std::string& err) {
 // resident (a device copy) or goes; a spare there leaves the spare table; the slots are kLent after this.
 bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err) {
     FastState* F = fast_;
+    // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
+    return lend_slots([F, limit](int il, int s) {
+        const auto& P = F->lp[(size_t) il];
+        return s >= P.n_main && P.slot_ptr(s) < F->xpool + limit;
+    }, moved, dropped, err);
+}
+
+// Lend the slots `sel` picks (every layer's): their experts move over colder ones outside the selection (a device
+// copy) or go to the RAM tier (else to disk), spares there leave the spare table, and they become kLent - the tail
+// for a prompt (lend_tail), the top of a layer for an elastic context (pool_give)
+bool Glm5Model::lend_slots(const std::function<bool(int, int)>& sel, uint64_t& moved, uint64_t& dropped,
+                           std::string& err) {
+    FastState* F = fast_;
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
     F->bg_hold = true;
@@ -1124,15 +1138,14 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             std::vector<std::pair<uint64_t, int>> cold;   // (count << 32 | recency rank, slot)
             if (!lend_drop)
                 for (int s = 0; s < P.n_main; ++s)
-                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0)
+                    if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0 && !sel(il, s))
                         cold.push_back({(uint64_t) F->cnt[(size_t) il * NE + P.key[(size_t) s]], s});
             std::sort(cold.begin(), cold.end(), [&](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : P.tick[(size_t) a.second] < P.tick[(size_t) b.second];
             });
             size_t ci = 0;
-            for (int s = P.n_main; s < P.n; ++s) {
-                // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+            for (int s = 0; s < P.n; ++s) {
+                if (!sel(il, s)) continue;
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
@@ -1265,6 +1278,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const Glm5Geometry& g = g_;
     const cudaStream_t s = S->cs;
     const PrefillState::View& V = S->v;
+    if (!el_.empty() && !seq_grow(V.seq < 0 ? 0 : V.seq, p0 + T, err)) return false;   // elastic: the chunk backed
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
 
@@ -2826,6 +2840,11 @@ bool Glm5Model::prefill_begin(int64_t n, int32_t next_token, bool background, st
         v.dsa_pool = m->dsa_pool_;
         v.img_pos = m->img_pos_;
         v.img_rows = m == this ? m->img_rows_ : std::vector<float>();   // (only the first part embeds)
+        // elastic: the whole prompt backed here, on the decode's thread, before it is read
+        if (!m->seq_grow(v.seq < 0 ? 0 : v.seq, v.pos + n, err)) {
+            for (Glm5Model* k = this; k != nullptr; k = k->split_next_.get()) k->pf_->v = PrefillState::View{};
+            return false;
+        }
     }
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
