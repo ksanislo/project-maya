@@ -618,38 +618,38 @@ function renderBanners(m) {
 function renderHero(live, h, last, eng, tiers, totals) {
   const gen = live.state === "generating";
   const speed = gen ? live.tok_s || 0 : 0;   // what is written now: nothing written, 0 (not the last request's rate)
-  $("hero-speed").textContent = fmt(speed, 1);
+  $("hero-speed").textContent = speed ? fmt(speed, 1) : "0";
   const writing = (live.requests || []).filter((r) => r.tok_s != null).length;
   $("hero-speed-sub").textContent = "decode · " + (gen ? (writing > 1 ? `${writing} answers at once` : "writing now")
                                     : live.state === "reading" ? "reading the prompt"
                                     : last && last.decode_tok_s ? `idle · last request ${fmt(last.decode_tok_s, 1)} tok/s` : "waiting for a request");
-  // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+  // prefill: every prompt being read now, together (the tokens read, not the reused prefix); 0 when none is read -
+  // the last request's rate goes in the subtitle
+  const readingNow = live.state === "reading" || (live.requests || []).some((r) => r.tok_s == null);
+  const prefill = live.state !== "idle" && readingNow ? (live.prefill_tok_s ?? live.prefill_tok_s_mean ?? 0) : 0;
+  const lastPre = last ? (last.prefill_tok_s != null ? last.prefill_tok_s
                           : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
                 : null;
-  $("hero-prefill").textContent = prefill == null ? "–" : fmt(prefill);
-  const readingNow = live.state === "reading" || (live.requests || []).some((r) => r.tok_s == null);
-  $("hero-prefill-sub").textContent = "prefill · " + (readingNow ? "reading now" : gen ? "this request"
-                                      : last ? "last request" : "waiting");
+  $("hero-prefill").textContent = fmt(prefill);
+  $("hero-prefill-sub").textContent = "prefill · " + (readingNow ? "reading now"
+                                      : lastPre ? `${gen ? "none reading" : "idle"} · last prompt ${fmt(lastPre)} tok/s` : "nothing to read");
   const a = spark("hero-spark", h.tok_s);
-  const b = spark("hero-spark-prefill", h.prefill_tok_s_mean);
+  const b = spark("hero-spark-prefill", h.prefill_tok_s || h.prefill_tok_s_mean);
   $("hero-spark-wrap").classList.toggle("is-empty", !a && !b);
   const tn = tiers && tiers.now;
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
-  const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : last && last.decode_tok_s ? 1000 / last.decode_tok_s : null;
+  const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   $("hero-ms").innerHTML = ms == null ? "–" : `${fmt(ms, 1)}<small>ms</small>`;
   $("hero-hit").innerHTML = fresh && tn.vram_hit != null ? `${fmt(100 * tn.vram_hit, 1)}<small>%</small>`
                           : last && last.hit_rate != null ? `${fmt(100 * last.hit_rate, 1)}<small>%</small>` : "–";
+  // the context every running conversation holds, together
   const ctx = eng.max_context || 0;
   const reqs = live.requests || [];
-  let used = 0;
-  if (live.state !== "idle" && reqs.length > 1) used = Math.max(...reqs.map((r) => (r.prompt_tokens || 0) + (r.generated || 0)));
-  else if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  $("hero-ctx-k").textContent = live.state === "idle" ? "Context of the last request"
-                              : reqs.length > 1 ? "Deepest context now" : "Context of this request";
-  $("hero-ctx").innerHTML = ctx ? `${kfmt(used)}<small>/ ${ctxfmt(ctx)}</small>` : "–";
+  const used = live.state === "idle" ? 0 : live.context_in_use ?? reqs.reduce((a, r) => a + (r.prompt_tokens || 0) + (r.generated || 0), 0);
+  $("hero-ctx-k").textContent = "Context in use";
+  $("hero-ctx").innerHTML = live.state === "idle" ? `0<small>idle</small>`
+                          : reqs.length > 1 ? `${kfmt(used)}<small>in ${reqs.length} conversations</small>`
+                          : `${kfmt(used)}<small>${ctx ? `/ ${ctxfmt(ctx)}` : ""}</small>`;
   $("hero-req").textContent = totals && totals.requests != null ? fmt(totals.requests) : "–";
 }
 
