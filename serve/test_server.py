@@ -416,6 +416,16 @@ class PrefixCheckpoint(unittest.TestCase):
         self.assertEqual(self.cp([{"role": "user", "content": "no system part"}])[0], 0)
         self.assertEqual(self.cp([{"role": "system", "content": "only a system part"}])[0], 0)
 
+    def test_gen_tail(self):
+        kw = {}
+        ids, _, _ = self.svc.prepare([{"role": "user", "content": "hello"}], None, kw)
+        n = kw.get("_gen_tail")
+        self.assertGreater(n, 0)
+        bare = self.tok.encode(self.tmpl.render([{"role": "user", "content": "hello"}], add_generation_prompt=False),
+                               parse_special=True)
+        self.assertEqual(ids[:len(ids) - n], bare)   # the state kept before the reply's opening: the history alone
+        self.assertIn("gt=3", StrataEngine.sampling_keys({"temperature": 0, "_gen_tail": 3}).split())
+
     def test_reaches_the_engine(self):
         seen = {}
 
@@ -437,6 +447,7 @@ class PrefixCheckpoint(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
         self.assertGreater(seen.get("_checkpoint", 0), 0)
+        self.assertGreater(seen.get("_gen_tail", 0), 0)
 
 
 class GpuChoice(unittest.TestCase):
