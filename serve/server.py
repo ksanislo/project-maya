@@ -1580,22 +1580,26 @@ class Service:
         utils = [g.get("util") for g in now.get("gpus") or []] or [now.get("gpu_util")]
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
+    @staticmethod
+    def _rate_of(r, now):
+        """One request's tok/s over the last RATE_WINDOW_S seconds (its mean so far while younger); None before its
+        first token."""
+        if r.get("queued") or not r.get("first_token"):
+            return None
+        rate = r["rate"]
+        newest = rate[-1] if rate else None
+        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
+        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
+            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
+        if newest and now - newest[0] > RATE_WINDOW_S:   # nothing new for a while (its turn waits): not writing now
+            return 0.0
+        return r["generated"] / max(RATE_MIN_SPAN_S, now - r["first_token"])
+
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds, summed over the requests that are generating.  Returns 0.0
         while nothing is generating."""
         now = time.time()
-        total = 0.0
-        for r in self._live_records():
-            if r.get("queued") or not r.get("first_token"):
-                continue
-            rate = r["rate"]
-            newest = rate[-1] if rate else None
-            oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
-            if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
-                total += max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-            else:
-                total += r["generated"] / max(RATE_MIN_SPAN_S, now - r["first_token"])
-        return total
+        return sum(self._rate_of(r, now) or 0.0 for r in self._live_records())
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
@@ -1657,11 +1661,15 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": (rr.get("prefill_tok_s") if rr else self._engine_prefill()) if busy else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                "places": max(1, int(getattr(self.engine, "multi", 0) or 0)),   # conversations at once
                 "requests": [{"id": r.get("key"), "phase": r.get("phase"), "generated": r.get("generated"),
-                              "max_tokens": r.get("max_tokens"),
+                              "max_tokens": r.get("max_tokens"), "prompt_tokens": r.get("prompt_tokens"),
+                              "prompt_read": r.get("prompt_read"), "prompt_total": r.get("prompt_total"),
+                              "prefill_tok_s": r.get("prefill_tok_s"),
                               "elapsed_s": round(now - r["started"], 1) if r.get("started") else None,
+                              "tok_s": None if (v := self._rate_of(r, now)) is None else round(v, 1),
                               "tok_s_mean": round(r["generated"] / max(1e-6, now - r["first_token"]), 1)
-                              if r.get("first_token") else None} for r in recs]}
+                              if r.get("first_token") else None} for r in sorted(recs, key=lambda r: r.get("started") or now)]}
         if rr is not None:
             live["prompt_read"], live["prompt_total"] = rr["prompt_read"], rr["prompt_total"]
         elif state == "reading" and progress:
