@@ -1422,8 +1422,26 @@ static int glm_pack_generate(const Options& o) {
     // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is restored
     // when this prompt extends it - a chat's next turn reads only what is new; else a slot that holds it, else a reset.
     // The tokens the state already holds.
+    size_t restore_lcp = 0;   // the longest prefix this prompt shares with a kept conversation (prep_restore)
+    // the idle contexts' conversations, for that measure (the several-conversation scheduler sets it)
+    std::function<void(const std::function<void(const std::vector<int32_t>&)>&)> each_ctx_snap;
     const auto prep_restore = [&](const std::vector<int32_t>& prompt) -> size_t {
         size_t reuse = 0;
+        // the longest prefix shared with any slot or context's conversation (a whole one is what can be taken back;
+        // a shared stretch of one that goes on differently is where a checkpoint would serve both)
+        restore_lcp = 0;
+        size_t lcp_of = 0;
+        const auto lcp_with = [&](const std::vector<int32_t>& t) {
+            const size_t k = (size_t) (std::mismatch(t.begin(), t.begin() + (long) std::min(t.size(), prompt.size()),
+                                                     prompt.begin()).first - t.begin());
+            if (k > restore_lcp) {
+                restore_lcp = k;
+                lcp_of = t.size();
+            }
+        };
+        for (const auto& sl : slots) lcp_with(sl.tokens);
+        lcp_with(snap_tokens);
+        if (each_ctx_snap) each_ctx_snap(lcp_with);
         strata::core::progress_at("the request: restoring a conversation");
         if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
@@ -1444,6 +1462,9 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (reuse == 0) model.reset();
+        if (reuse == 0 && prompt.size() >= 1024)
+            std::fprintf(stderr, "glm slots: nothing kept continues this %zu-token prompt; the closest (%zu tokens) shares "
+                         "its first %zu\n", prompt.size(), lcp_of, restore_lcp);
         return reuse;
     };
     // the prompt from token i on through the token path, the state saved before its LAST token (an identical or
@@ -1509,17 +1530,24 @@ static int glm_pack_generate(const Options& o) {
         if (slot_max <= 0 || !model.fast() || cp < (int64_t) reuse + 64 || cp < std::max<int64_t>(1024, (int64_t) slot_min) ||
             cp >= (int64_t) sa || img_hash((size_t) cp) != kNoImages)
             return false;
-        for (const auto& sl : slots)
-            if (sl.tokens.size() >= (size_t) cp && std::equal(prompt.begin(), prompt.begin() + cp, sl.tokens.begin()))
+        for (const auto& sl : slots)   // (one that goes on past cp cannot be taken back by a prompt that differs there)
+            if (sl.tokens.size() == (size_t) cp && std::equal(prompt.begin(), prompt.begin() + cp, sl.tokens.begin()))
                 return false;
         return true;
+    };
+    // the checkpoint for this prompt: where it parts from a kept conversation (DIVERGENCE: the stretch they share,
+    // whatever the client - an agent's sessions share their instructions, a rewritten history its unchanged part),
+    // else the server's system part (cp); 0: none
+    const auto pick_cp = [&](const std::vector<int32_t>& prompt, size_t reuse, int64_t cp, size_t sa) -> int64_t {
+        if (cp_wanted(prompt, reuse, (int64_t) restore_lcp, sa)) return (int64_t) restore_lcp;
+        return cp_wanted(prompt, reuse, cp, sa) ? cp : 0;
     };
     const auto cp_save = [&](const std::vector<int32_t>& prompt, int64_t cp) {
         if (!model.snapshot_save()) return;
         snap_tokens.assign(prompt.begin(), prompt.begin() + cp);
         snap_img_hash = kNoImages;
         snap_in_slot = false;
-        slot_put(" (a system prompt other conversations can start from)");
+        slot_put(" (a shared start other conversations can take back)");
         for (auto& sl : slots)
             if (sl.tokens == snap_tokens && !sl.shared) {
                 sl.shared = true;
@@ -1556,14 +1584,14 @@ static int glm_pack_generate(const Options& o) {
                 return !stop_req.load() && !admit_stop.load();
             };
             bool pok = true;
-            if (cp_wanted(prompt, reuse, req_cp, sa)) {   // the system part first, then its checkpoint
-                const std::vector<int32_t> head(prompt.begin() + (long) reuse, prompt.begin() + req_cp);
-                pok = model.prefill(head, err, prompt[(size_t) req_cp]);
+            if (const int64_t cp = pick_cp(prompt, reuse, req_cp, sa); cp > 0) {   // up to the checkpoint first
+                const std::vector<int32_t> head(prompt.begin() + (long) reuse, prompt.begin() + cp);
+                pok = model.prefill(head, err, prompt[(size_t) cp]);
                 if (pok) {
-                    cp_save(prompt, req_cp);
-                    i_first = (size_t) req_cp;   // (a rest too short for the prompt path: the token path from here)
-                    part.assign(prompt.begin() + req_cp, prompt.begin() + (long) sa);
-                    const size_t base = (size_t) req_cp - reuse;
+                    cp_save(prompt, cp);
+                    i_first = (size_t) cp;   // (a rest too short for the prompt path: the token path from here)
+                    part.assign(prompt.begin() + cp, prompt.begin() + (long) sa);
+                    const size_t base = (size_t) cp - reuse;
                     model.prefill_progress = [&, base](int64_t done, int64_t total) {
                         (void) total;
                         pp_line(base + (size_t) done);
@@ -1876,6 +1904,10 @@ static int glm_pack_generate(const Options& o) {
             cur_ctx = c;
         }
         model.seq_bind_all(c);   // (the pipelined decode binds the model's sequences itself)
+    };
+    each_ctx_snap = [&](const std::function<void(const std::vector<int32_t>&)>& f) {
+        for (int c = 0; c < (int) ctxs.size(); ++c)
+            if (c != cur_ctx) f(ctxs[(size_t) c].snap_tokens);
     };
     struct Gen {
         int rid = -1, ctx = 0;
@@ -2352,9 +2384,9 @@ static int glm_pack_generate(const Options& o) {
             g->gt = req_gt;
             const size_t sa = snap_pos(g->prompt, g->gt);
             if (model.prefill_chunk() > 0 && sa > g->reuse + 1) {
-                const bool cpw = cp_wanted(g->prompt, g->reuse, g->cp, sa);
-                bool started = reader_start(g.get(), g->reuse, cpw ? (size_t) g->cp : sa, cpw ? g->cp : 0);
-                if (!started && cpw && err.empty())   // the head refused, no error: the whole prompt in one read
+                const int64_t cp = pick_cp(g->prompt, g->reuse, g->cp, sa);
+                bool started = reader_start(g.get(), g->reuse, cp > 0 ? (size_t) cp : sa, cp);
+                if (!started && cp > 0 && err.empty())   // the head refused, no error: the whole prompt in one read
                     started = reader_start(g.get(), g->reuse, sa, 0);
                 if (started) {
                     tag.clear();
