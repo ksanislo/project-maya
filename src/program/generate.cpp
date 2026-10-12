@@ -2493,7 +2493,7 @@ static int glm_pack_generate(const Options& o) {
                             g->prompt.size());
                 return;
             }
-            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows});
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows, req_cp, req_gt});
             std::fprintf(stderr, "glm multi: request %d waits for context memory (%lld tokens)\n", rid, (long long) want);
             return;
         }
