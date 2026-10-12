@@ -2927,10 +2927,15 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         for (int64_t t : ramp) rs += t;
         const auto push = [&](int64_t t) { off.push_back(off.back() + t); };
         if (!ramp.empty() && n >= 2 * rs + 2 * (int64_t) Tc) {
+            // the middle in full chunks (the kernels work in 64-row blocks: odd sizes pad every chunk); its rest goes
+            // into the closing ramp's first chunk when that stays within a full one, else one chunk of its own
             for (int64_t t : ramp) push(t);
-            const int64_t mid = n - 2 * rs, k = (mid + Tc - 1) / Tc;   // the middle in k equal chunks (no small rest)
-            for (int64_t i = 0; i < k; ++i) push(mid / k + (i < mid % k ? 1 : 0));
-            for (auto it = ramp.rbegin(); it != ramp.rend(); ++it) push(*it);
+            const int64_t mid = n - 2 * rs, full = mid / Tc, rest = mid % Tc;
+            for (int64_t i = 0; i < full; ++i) push(Tc);
+            std::vector<int64_t> tail(ramp.rbegin(), ramp.rend());
+            if (rest > 0 && tail[0] + rest <= Tc) tail[0] += rest;
+            else if (rest > 0) push(rest);
+            for (int64_t t : tail) push(t);
         } else {
             for (int64_t i = 0; i < n; i += Tc) push(std::min<int64_t>(Tc, n - i));
         }
