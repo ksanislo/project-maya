@@ -624,7 +624,8 @@ class StrataEngine:
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
-            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling)
+            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + \
+                StrataEngine.checkpoint_key(sampling)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -660,7 +661,14 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.checkpoint_key(sampling)
+
+    @staticmethod
+    def checkpoint_key(sampling: dict) -> str:
+        """`cp=<n>`: the prompt's first n tokens are its system part (prepare) - the engine keeps a slot there, so
+        another conversation with the same system prompt starts from it."""
+        cp = sampling.get("_checkpoint")
+        return f" cp={cp}" if isinstance(cp, int) and not isinstance(cp, bool) and cp > 0 else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1670,6 +1678,20 @@ class Service:
             prompt += prefill
         given["_prefill"] = prefill
         ids = self.tok.encode(prompt, parse_special=True)
+        # the system part's end (the leading system messages and the tools), when it is a prefix of the prompt's tokens
+        given["_checkpoint"] = 0
+        lead = 0
+        while lead < len(messages) and messages[lead].get("role") == "system":
+            lead += 1
+        if 0 < lead < len(messages) and not images_of(messages[:lead]):
+            try:
+                sys_ids = self.tok.encode(self.template.render(messages[:lead], tools=tools,
+                                                               **{**kwargs, "add_generation_prompt": False}),
+                                          parse_special=True)
+                if 0 < len(sys_ids) < len(ids) - 1 and ids[:len(sys_ids)] == sys_ids:
+                    given["_checkpoint"] = len(sys_ids)
+            except Exception:   # a template that cannot render the system part alone: no checkpoint
+                pass
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -3025,6 +3047,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_checkpoint"):
+                req = {**req, "_checkpoint": kw["_checkpoint"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -3115,6 +3139,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_checkpoint"):
+                req = {**req, "_checkpoint": kw["_checkpoint"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
