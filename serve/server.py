@@ -1758,7 +1758,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "prefill_tok_s": self._prefill_tok_s()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -1801,6 +1802,13 @@ class Service:
                 continue
             total += r["generated"] / max(1e-6, now - r["first_token"])
         return total
+
+    def _prefill_tok_s(self):
+        """Prompt tokens read per second now, summed over the requests reading theirs (each one's engine rate over
+        what it has read); 0.0 while none reads - not the last value seen."""
+        with self.status_lock:
+            return sum(r["prefill_tok_s"] for r in self.live.values() if not r.get("queued")
+                       and r.get("first_token") is None and r.get("prefill_tok_s") is not None)
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
@@ -1853,6 +1861,8 @@ class Service:
                 "prefill_tok_s_mean": (rr.get("prefill_tok_s") if rr else self._engine_prefill()) if busy else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
                 "places": max(1, int(getattr(self.engine, "multi", 0) or 0)),   # conversations at once
+                "prefill_tok_s": round(self._prefill_tok_s(), 1) if busy else 0.0,   # every prompt read now
+                "context_in_use": sum((r.get("prompt_tokens") or 0) + (r.get("generated") or 0) for r in recs),
                 "requests": [{"id": r.get("key"), "phase": r.get("phase"), "generated": r.get("generated"),
                               "max_tokens": r.get("max_tokens"), "prompt_tokens": r.get("prompt_tokens"),
                               "prompt_read": r.get("prompt_read"), "prompt_total": r.get("prompt_total"),
