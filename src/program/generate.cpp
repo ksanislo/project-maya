@@ -2387,6 +2387,7 @@ static int glm_pack_generate(const Options& o) {
                 cx.busy = false;
                 cx.used = ++ctx_clock;
                 cx.held = g.rid;
+                cx.idle_since = std::chrono::steady_clock::now();   // (paused: not idle for the hold)
                 pending.push_back(std::move(g.orig));
                 g.done = true;
                 gen_sweep();
