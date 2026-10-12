@@ -250,11 +250,14 @@ bool Glm5Model::pool_give(size_t bytes, std::string& err) {
             const int room = y.live - floor_slots;
             if (room <= 0) continue;
             const int j = std::min(room, std::max(1, (int) std::min<size_t>(16, (bytes - got + y.stride - 1) / y.stride)));
-            double c = 0;
+            // the share of this layer's own traffic those slots serve, per byte: a layer used only part of the time (the
+            // NextN block drafts only alone) is not the cheapest just because its counts grow slower
+            double c = 0, tot = 0;
             for (int s = y.live - j; s < y.live; ++s)
                 if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0)
                     c += (double) F->cnt[(size_t) il * NE + P.key[(size_t) s]];
-            c /= j;
+            for (int e = 0; e < NE; ++e) tot += (double) F->cnt[(size_t) il * NE + e];
+            c /= std::max(1.0, tot) * (double) j * (double) y.stride;
             if (best < 0 || c < bc) {
                 best = il;
                 bj = j;
