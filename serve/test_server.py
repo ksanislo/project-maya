@@ -531,7 +531,7 @@ class LiveRate(unittest.TestCase):
         self.svc.engine = engine
         self.svc.status.update(busy=True, first_token=None)
         self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
-        self.assertNotIn("prefill_tok_s", self.metrics()["live"])
+        self.assertEqual(self.metrics()["live"]["prefill_tok_s"], 0.0)   # the live total: no request record reads
         self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
         self.svc.status.update(first_token=time.time(), generated=1)
         self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
@@ -592,10 +592,20 @@ class LiveRate(unittest.TestCase):
             self.assertEqual(rs[911]["prompt_tokens"], 1200)
             self.assertAlmostEqual(live["tok_s"], 10.0, delta=0.5)
             self.assertGreaterEqual(live["places"], 1)
+            self.assertEqual(live["prefill_tok_s"], 0.0)          # nothing reads: 0, not the last value seen
+            self.assertEqual(live["context_in_use"], 1200 + 50 + 800 + 300)
+            with self.svc.status_lock:
+                self.svc.live[913] = {"key": 913, "phase": "reading the prompt", "generated": 0, "started": now - 5,
+                                      "first_token": None, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                      "prompt_tokens": 9000, "rate": collections.deque(maxlen=32),
+                                      "prompt_read": 4096, "prompt_total": 9000, "prefill_tok_s": 431.0}
+            live = self.metrics()["live"]
+            self.assertEqual(live["prefill_tok_s"], 431.0)
+            self.assertEqual(live["context_in_use"], 1200 + 50 + 800 + 300 + 9000)
         finally:
             with self.svc.status_lock:
-                self.svc.live.pop(911, None)
-                self.svc.live.pop(912, None)
+                for k in (911, 912, 913):
+                    self.svc.live.pop(k, None)
                 self.svc.status["busy"] = False
 
     def test_the_live_number_is_a_rate(self):
