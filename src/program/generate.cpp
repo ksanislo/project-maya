@@ -2317,6 +2317,9 @@ static int glm_pack_generate(const Options& o) {
                 gen_sweep();
                 return;
             }
+            // the read ended before the stop took (it is checked between chunks only): the request goes on - left
+            // set, the flag cancelled it unanswered (finish "length", 0 tokens)
+            if (!asked) admit_stop.store(false);
         }
         tag = std::to_string(g.rid) + " ";
         int rc = 0;
@@ -2939,6 +2942,7 @@ static int glm_pack_generate(const Options& o) {
             decoding_now.store(dec, std::memory_order_relaxed);
         }
         if (multi && reader && !reader_yield && read_slice_s > 0 && !pending.empty() && !admit_stop.load() &&
+            reader->part.size() > (size_t) std::max<int64_t>(1, model.prefill_chunk()) &&   // (one chunk: no stop)
             std::chrono::duration<double>(std::chrono::steady_clock::now() - reader->t0).count() >= read_slice_s) {
             bool other = false;   // (one that an idle context can take now)
             for (const auto& w : pending) {
