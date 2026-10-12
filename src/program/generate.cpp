@@ -1782,6 +1782,7 @@ static int glm_pack_generate(const Options& o) {
         bool snap_in_slot = false;
         uint64_t used = 0;
         bool busy = false;
+        std::chrono::steady_clock::time_point idle_since{};   // its last request's end
     };
     std::vector<Ctx> ctxs((size_t) model.seq_count());
     int cur_ctx = 0;
@@ -1879,6 +1880,10 @@ static int glm_pack_generate(const Options& o) {
     const auto input_pending = [&]() -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
         return !in_lines.empty() || quit_req.load();
+    };
+    const auto in_lines_ready = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(in_mu);
+        return !in_lines.empty();
     };
     const auto try_line = [&](std::string& out) -> bool {
         std::lock_guard<std::mutex> lk(in_mu);
@@ -2013,11 +2018,15 @@ static int glm_pack_generate(const Options& o) {
         }
         ctxs[(size_t) g.ctx].busy = false;
         ctxs[(size_t) g.ctx].used = ++ctx_clock;
+        ctxs[(size_t) g.ctx].idle_since = std::chrono::steady_clock::now();
         g.done = true;
     };
     const auto gen_sweep = [&] {
         gens.erase(std::remove_if(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }),
                    gens.end());
+        // elastic: what the contexts' budget holds beyond its base (a released context's surplus, a finished request's
+        // room) goes back to the experts now, not only when the engine is idle (a cheap check when there is none)
+        if (model.elastic()) model.pool_take_back_all();
         if (gens.empty()) {
             stop_req.store(false);
             if (model.fast()) model.save_usage();   // this machine's expert usage, for the next start's warm-up
@@ -2077,6 +2086,70 @@ static int glm_pack_generate(const Options& o) {
             model.reset();
         }
         gen_sweep();
+    };
+    // ELASTIC CONTEXTS (STRATA_GLM_ELASTIC): the contexts share a budget per card for their context-sized caches.
+    // When a request needs more than is left, idle contexts give theirs back, least recently used first - the
+    // conversation goes to a slot first (when slots are on), so its next turn reloads it instead of reading it again
+    const auto release_idle = [&](int keep, const std::function<bool()>& enough, double min_idle_s = 0) -> bool {
+        if (!model.elastic()) return enough();
+        const auto now = std::chrono::steady_clock::now();
+        while (!enough()) {
+            int v = -1;
+            for (int c = 0; c < (int) ctxs.size(); ++c)
+                if (c != keep && !ctxs[(size_t) c].busy && model.seq_holds(c) &&
+                    std::chrono::duration<double>(now - ctxs[(size_t) c].idle_since).count() >= min_idle_s &&
+                    (v < 0 || ctxs[(size_t) c].used < ctxs[(size_t) v].used))
+                    v = c;
+            if (v < 0) return false;
+            bind_ctx(v);
+            slot_put(" (its context's memory went to another conversation)");
+            snap_tokens.clear();
+            model.seq_release(v, true);
+            std::fprintf(stderr, "glm elastic: context %d released for another conversation\n", v);
+        }
+        return true;
+    };
+    // context c to back `tokens` positions: within the budget, else contexts idle for STRATA_GLM_ELASTIC_HOLD_S (120)
+    // give theirs back, else expert slots give way, else any idle context (a conversation that just ended is likely to
+    // come back: to a slot and back costs seconds; the pipeline drained first; not while a prompt is read beside the
+    // decode - then false, try later)
+    static const double hold_s = env_num("STRATA_GLM_ELASTIC_HOLD_S", 120);
+    const auto ctx_reserve = [&](int c, int64_t tokens) -> bool {
+        if (!model.elastic()) return true;
+        tokens = std::min<int64_t>(tokens, model.seq_max_ctx(c));
+        const auto enough = [&] { return model.seq_can_grow(c, tokens); };
+        bool ok = release_idle(c, enough, hold_s);
+        std::string re;
+        if (!ok && !reader && multi_drain()) ok = model.seq_reserve_all(c, tokens, re);
+        if (!ok) ok = release_idle(c, enough);
+        if (!ok) {
+            if (!re.empty()) std::fprintf(stderr, "%s\n", re.c_str());
+            return false;
+        }
+        // (a slot no conversation was in: its state backed now, out of the room just found)
+        std::string ae;
+        if (!model.seq_active(c) && !model.seq_grow_all(c, 1, ae)) {
+            std::fprintf(stderr, "%s\n", ae.c_str());
+            return false;
+        }
+        return true;
+    };
+    // the engine idle: idle contexts beyond the STRATA_GLM_ELASTIC_KEEP most recent (1) give their memory back (to a
+    // slot first), and what the budget holds beyond its base goes back to the experts - a conversation alone gets the
+    // whole pool again
+    const auto idle_trim = [&] {
+        static const int keep_n = (int) env_num("STRATA_GLM_ELASTIC_KEEP", 1);
+        std::vector<int> order;
+        for (int c = 0; c < (int) ctxs.size(); ++c)
+            if (!ctxs[(size_t) c].busy && model.seq_holds(c)) order.push_back(c);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return ctxs[(size_t) a].used > ctxs[(size_t) b].used; });
+        for (size_t i = (size_t) std::max(0, keep_n); i < order.size(); ++i) {
+            bind_ctx(order[i]);
+            slot_put(" (an idle context's memory went back to the experts)");
+            snap_tokens.clear();
+            model.seq_release(order[i], true);
+        }
+        model.pool_take_back_all();
     };
     // a request whose prompt has been read (it is in gens): its first token, or its end if it was stopped meanwhile
     const auto gen_admitted = [&](Gen& g) {
@@ -2211,6 +2284,16 @@ static int glm_pack_generate(const Options& o) {
                          (long long) want);
             return;
         }
+        if (model.elastic() && !ctx_reserve(best, want)) {
+            if (gens.empty()) {
+                std::printf("ERR %d prompt (%zu tokens) + room for the answer exceeds the contexts' memory\n", rid,
+                            g->prompt.size());
+                return;
+            }
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows});
+            std::fprintf(stderr, "glm multi: request %d waits for context memory (%lld tokens)\n", rid, (long long) want);
+            return;
+        }
         g->max_new = std::min<int64_t>(max_new, model.seq_max_ctx(best) - (int64_t) g->prompt.size() - 8);
         if (gens.empty()) stop_req.store(false);
         bind_ctx(best);
@@ -2282,7 +2365,9 @@ static int glm_pack_generate(const Options& o) {
     // the waiting requests, in order, that an idle context can now hold (a STOP for one ends it unread)
     const auto admit_pending = [&] {
         if (reader) return;
-        for (size_t i = 0; i < pending.size();) {
+        // (each waiting request looked at once a pass: one gen_admit queues again goes to the back)
+        size_t left = pending.size();
+        for (size_t i = 0; left > 0 && i < pending.size(); --left) {
             const Pending& w = pending[i];
             bool stopped = false;
             {
@@ -2326,6 +2411,13 @@ static int glm_pack_generate(const Options& o) {
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
         if (only != nullptr && !only->inflight && !only->reading && multi_spec && model.spec_ready()) {
             Gen& g = *only;
+            // elastic: a stint of at most 4096 tokens, room for it reserved first (not the whole answer: that pushed out
+            // the conversation that had just ended, to a slot and back for its next turn)
+            int64_t stint = g.max_new - g.produced;
+            if (model.elastic()) {
+                stint = std::min<int64_t>(stint, 4096);
+                ctx_reserve(g.ctx, model.seq_pos(g.ctx) + stint + 8);
+            }
             bind_ctx(g.ctx);
             if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
                 if (!model.forward({g.pending}, lg, err)) {
@@ -2338,12 +2430,16 @@ static int glm_pack_generate(const Options& o) {
             model.force_next(g.force);
             g.force = -1;
             int32_t last = -1, forced_unused = -1;
-            bool interrupted = false;
-            int64_t n_spec = 0;
-            const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
+            bool interrupted = false, ended = false;
+            int64_t n_spec = 0, n_stint = 0;
+            const bool ok = model.decode_spec(g.sp, stint, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;
-                if (!gen_token(g, tok)) return false;
+                ++n_stint;
+                if (!gen_token(g, tok)) {
+                    ended = true;
+                    return false;
+                }
                 if (g.force >= 0) {
                     model.force_next(g.force);
                     forced_unused = g.force;
@@ -2363,8 +2459,8 @@ static int glm_pack_generate(const Options& o) {
                 multi_fail(err);
                 return;
             }
-            // not interrupted by input: decode_spec ended the request (a stop, its budget, the context)
-            if (interrupted) g.pending = last;
+            // not interrupted by input: decode_spec ended the request (a stop, its budget, the context) - or the stint
+            if (interrupted || (!ended && n_stint == stint && g.produced < g.max_new && last >= 0)) g.pending = last;
             else gen_finish(g);
             gen_sweep();
             return;
@@ -2406,6 +2502,14 @@ static int glm_pack_generate(const Options& o) {
         for (auto& gp : gens) {
             Gen& g = *gp;
             if (g.done || g.inflight || g.pending < 0) continue;
+            // elastic: the next position must fit the budget - idle contexts give way, else the answer ends here
+            if (model.elastic() && !model.seq_can_grow(g.ctx, model.seq_pos(g.ctx) + 2) &&
+                !ctx_reserve(g.ctx, model.seq_pos(g.ctx) + 2 + 4096)) {
+                if (reader) continue;   // (a prompt is being read: the experts give way after it)
+                std::fprintf(stderr, "glm elastic: request %d ends - no context memory left\n", g.rid);
+                gen_finish(g);
+                continue;
+            }
             if (!model.multi_issue(g.ctx, g.pending, g.sp, err)) {
                 multi_fail(err);
                 return;
@@ -2745,8 +2849,14 @@ static int glm_pack_generate(const Options& o) {
         profile_saved_at = Clock::now();
     };
     std::string line;
+    bool trimmed = true;
     for (;;) {
         if (multi && !pending.empty()) admit_pending();
+        if (multi && !gens.empty()) trimmed = false;
+        else if (multi && !trimmed && model.elastic() && !in_lines_ready()) {
+            idle_trim();
+            trimmed = true;
+        }
         if (multi && !gens.empty()) {   // requests running: a line when one is there, else one scheduler step
             if (!try_line(line)) {
                 struct StepScope {
