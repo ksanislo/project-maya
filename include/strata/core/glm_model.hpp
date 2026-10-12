@@ -692,6 +692,12 @@ public:
     /// left; no logits.  false with `err` empty when the fast path has no prompt path (feed them to forward()).
     bool prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token = -1);
     bool prefill_run(const std::vector<int32_t>& tokens, std::string& err);   // prefill() between lend and return
+    /// prefill() in three steps, for a prompt read on another thread beside the decode (STRATA_GLM_SEQS): begin takes
+    /// the bound sequence's layout and lends (false with `err` empty: no prompt path for these n tokens - the token
+    /// path), prefill_run reads, finish returns and moves that sequence's position.  begin and finish on the
+    /// decode's thread with nothing in flight.
+    bool prefill_begin(int64_t n, int32_t next_token, bool background, std::string& err);
+    bool prefill_finish(std::string& err);
     int prefill_chunk() const;                             // tokens per chunk (0: no prompt path)
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
