@@ -244,6 +244,8 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
 .conv__who .st-badge[data-s="reading"] { background: var(--st-info-tint); color: var(--st-info-text); border-color: transparent; }
 .conv__who .st-badge[data-s="generating"] { background: var(--st-accent-tint); color: var(--st-accent-text); border-color: transparent; }
 .conv__who .st-badge[data-s="waiting"] { color: var(--st-ink-muted); }
+.conv--done { opacity: .62; }
+.conv--done .st-progress__bar { background: var(--st-ink-muted); }
 .conv__prog { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .conv__prog .muted { font-size: var(--st-fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conv__num { display: flex; flex-direction: column; align-items: flex-end; gap: 0; }
