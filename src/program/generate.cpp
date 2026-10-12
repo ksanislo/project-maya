@@ -1971,6 +1971,10 @@ static int glm_pack_generate(const Options& o) {
     // stuck behind a large one, and a large one still moves every round
     static const double read_slice_s = env_num("STRATA_GLM_READ_SLICE_S", 6);
     bool reader_yield = false;
+    // READ SHARE: while a request decodes, a read takes at most STRATA_GLM_READ_SHARE (0.5; 1: no limit) of the time -
+    // after each chunk the Reader waits that chunk's time x (1 - share) / share, and the decode has the cards
+    static const double read_share = std::min(1.0, std::max(0.05, env_num("STRATA_GLM_READ_SHARE", 0.5)));
+    std::atomic<bool> decoding_now{false};
     std::unique_ptr<Reader> reader;
     static const bool prefill_fg = env_num("STRATA_GLM_PREFILL_FG", 0) != 0;
     // an error or the end: the prompt stops at its next chunk, the tail goes back; its request is left to the caller
@@ -2235,8 +2239,18 @@ static int glm_pack_generate(const Options& o) {
         const std::string rtag = std::to_string(gp->rid) + " ";
         const auto rt0 = gp->t0;
         const size_t rtotal = gp->prompt.size(), rfrom = from, rreuse = gp->reuse;
-        model.prefill_progress = [&, rtag, rt0, rtotal, rfrom, rreuse](int64_t done, int64_t total) {
+        auto last = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+        model.prefill_progress = [&, rtag, rt0, rtotal, rfrom, rreuse, last](int64_t done, int64_t total) {
             (void) total;
+            if (read_share < 1.0 && decoding_now.load(std::memory_order_relaxed)) {
+                const auto t = std::chrono::steady_clock::now();
+                const auto until = t + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           (t - *last) * ((1.0 - read_share) / read_share));
+                while (std::chrono::steady_clock::now() < until && !stop_req.load() && !admit_stop.load() &&
+                       decoding_now.load(std::memory_order_relaxed))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            *last = std::chrono::steady_clock::now();
             if (o.serve) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt0).count();
                 std::printf("PP %s%zu %zu %.1f %.1f\n", rtag.c_str(), rfrom + (size_t) done, rtotal, ms,
@@ -2919,6 +2933,11 @@ static int glm_pack_generate(const Options& o) {
     };
     std::string line;
     for (;;) {
+        if (multi) {   // (the Reader's share: someone decodes beside it)
+            bool dec = false;
+            for (const auto& gp : gens) dec = dec || (!gp->done && !gp->reading);
+            decoding_now.store(dec, std::memory_order_relaxed);
+        }
         if (multi && reader && !reader_yield && read_slice_s > 0 && !pending.empty() && !admit_stop.load() &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - reader->t0).count() >= read_slice_s) {
             bool other = false;   // (one that an idle context can take now)
