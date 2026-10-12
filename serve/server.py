@@ -647,9 +647,15 @@ class StrataEngine:
     @staticmethod
     def checkpoint_key(sampling: dict) -> str:
         """`cp=<n>`: the prompt's first n tokens are its system part (prepare) - the engine keeps a slot there, so
-        another conversation with the same system prompt starts from it."""
-        cp = sampling.get("_checkpoint")
-        return f" cp={cp}" if isinstance(cp, int) and not isinstance(cp, bool) and cp > 0 else ""
+        another conversation with the same system prompt starts from it.  `gt=<n>`: its last n tokens open the reply -
+        the engine keeps the conversation's state before them, so the next request continues it even when this answer
+        is cancelled or dropped from the history."""
+        keys = ""
+        for name, key in (("_checkpoint", "cp"), ("_gen_tail", "gt")):
+            v = sampling.get(name)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                keys += f" {key}={v}"
+        return keys
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1624,6 +1630,16 @@ class Service:
             prompt += prefill
         given["_prefill"] = prefill
         ids = self.tok.encode(prompt, parse_special=True)
+        # the reply's opening: the tokens the generation prompt (and a thinking-off close or a forced call) adds
+        given["_gen_tail"] = 0
+        try:
+            bare = self.template.render(messages, tools=tools, **{**kwargs, "add_generation_prompt": False})
+            if prompt.startswith(bare) and len(prompt) > len(bare):
+                tail = self.tok.encode(prompt[len(bare):], parse_special=True)
+                if 0 < len(tail) < len(ids) and ids[-len(tail):] == tail:
+                    given["_gen_tail"] = len(tail)
+        except Exception:   # a template that cannot render without the generation prompt: the last token only
+            pass
         # the system part's end (the leading system messages and the tools), when it is a prefix of the prompt's tokens
         given["_checkpoint"] = 0
         lead = 0
@@ -2970,8 +2986,9 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            if kw.get("_checkpoint"):
-                req = {**req, "_checkpoint": kw["_checkpoint"]}
+            for k in ("_checkpoint", "_gen_tail"):
+                if kw.get(k):
+                    req = {**req, k: kw[k]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -3062,8 +3079,9 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
-            if kw.get("_checkpoint"):
-                req = {**req, "_checkpoint": kw["_checkpoint"]}
+            for k in ("_checkpoint", "_gen_tail"):
+                if kw.get(k):
+                    req = {**req, k: kw[k]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
