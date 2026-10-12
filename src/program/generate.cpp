@@ -1888,6 +1888,7 @@ static int glm_pack_generate(const Options& o) {
         uint64_t used = 0;
         bool busy = false;
         std::chrono::steady_clock::time_point idle_since{};   // its last request's end
+        int held = -1;   // a read paused at the end of its slice: its request's rid (no other request takes it)
     };
     std::vector<Ctx> ctxs((size_t) model.seq_count());
     int cur_ctx = 0;
@@ -1911,7 +1912,21 @@ static int glm_pack_generate(const Options& o) {
         for (int c = 0; c < (int) ctxs.size(); ++c)
             if (c != cur_ctx) f(ctxs[(size_t) c].snap_tokens);
     };
+    // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
+    // here with what its GEN line said, and is admitted when one frees
+    struct Pending {
+        int rid;
+        std::vector<int64_t> ids;
+        int64_t max_new;
+        strata::kernels::SamplerParams rq;
+        int64_t think_budget;
+        int32_t think_end;
+        std::vector<int64_t> img_pos;
+        std::vector<float> img_rows;
+        int64_t cp = 0, gt = 0;
+    };
     struct Gen {
+        Pending orig;            // its GEN line: a read paused at the end of its slice goes back to the queue with it
         int rid = -1, ctx = 0;
         strata::kernels::SamplerParams sp;
         int64_t max_new = 0, produced = 0;
@@ -1952,7 +1967,17 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> part;
         size_t from = 0;      // the prompt token the part starts at
         int64_t cp = 0;       // > 0: the part ends at the system part's end - its checkpoint, then the rest
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     };
+    // READ SLICES: with another prompt waiting, a read stops at the first chunk boundary after STRATA_GLM_READ_SLICE_S
+    // (6; 0: off), keeps what it read and goes to the back of the queue - prompts take turns, a small one is not
+    // stuck behind a large one, and a large one still moves every round
+    static const double read_slice_s = env_num("STRATA_GLM_READ_SLICE_S", 6);
+    bool reader_yield = false;
+    // READ SHARE: while a request decodes, a read takes at most STRATA_GLM_READ_SHARE (0.5; 1: no limit) of the time -
+    // after each chunk the Reader waits that chunk's time x (1 - share) / share, and the decode has the cards
+    static const double read_share = std::min(1.0, std::max(0.05, env_num("STRATA_GLM_READ_SHARE", 0.5)));
+    std::atomic<bool> decoding_now{false};
     std::unique_ptr<Reader> reader;
     static const bool prefill_fg = env_num("STRATA_GLM_PREFILL_FG", 0) != 0;
     // an error or the end: the prompt stops at its next chunk, the tail goes back; its request is left to the caller
@@ -1967,19 +1992,6 @@ static int glm_pack_generate(const Options& o) {
         admitting_rid.store(-1);
         reader->g->reading = false;
         reader.reset();
-    };
-    // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
-    // here with what its GEN line said, and is admitted when one frees
-    struct Pending {
-        int rid;
-        std::vector<int64_t> ids;
-        int64_t max_new;
-        strata::kernels::SamplerParams rq;
-        int64_t think_budget;
-        int32_t think_end;
-        std::vector<int64_t> img_pos;
-        std::vector<float> img_rows;
-        int64_t cp = 0, gt = 0;
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
@@ -2302,8 +2314,18 @@ static int glm_pack_generate(const Options& o) {
         const std::string rtag = std::to_string(gp->rid) + " ";
         const auto rt0 = gp->t0;
         const size_t rtotal = gp->prompt.size(), rfrom = from, rreuse = gp->reuse;
-        model.prefill_progress = [&, rtag, rt0, rtotal, rfrom, rreuse](int64_t done, int64_t total) {
+        auto last = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+        model.prefill_progress = [&, rtag, rt0, rtotal, rfrom, rreuse, last](int64_t done, int64_t total) {
             (void) total;
+            if (read_share < 1.0 && decoding_now.load(std::memory_order_relaxed)) {
+                const auto t = std::chrono::steady_clock::now();
+                const auto until = t + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           (t - *last) * ((1.0 - read_share) / read_share));
+                while (std::chrono::steady_clock::now() < until && !stop_req.load() && !admit_stop.load() &&
+                       decoding_now.load(std::memory_order_relaxed))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            *last = std::chrono::steady_clock::now();
             if (o.serve) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt0).count();
                 std::printf("PP %s%zu %zu %.1f %.1f\n", rtag.c_str(), rfrom + (size_t) done, rtotal, ms,
@@ -2349,6 +2371,31 @@ static int glm_pack_generate(const Options& o) {
             if (!err.empty()) e = err;
             else tail_from = (size_t) cp_at;   // (a rest too short for the prompt path: the token path from there)
         }
+        if (reader_yield) {
+            reader_yield = false;
+            bool asked = stop_req.load();   // (a STOP for it meanwhile: the cancel below, as before)
+            {
+                std::lock_guard<std::mutex> lk(ctl_mu);
+                asked = asked || ctl.count(g.rid) > 0;
+            }
+            if (e == "cancelled" && !asked) {
+                admit_stop.store(false);
+                keep_partial(g.prompt, g.reuse);
+                std::fprintf(stderr, "glm multi: request %d's read pauses at %lld of %zu tokens - its turn again later\n",
+                             g.rid, (long long) model.position(), g.prompt.size());
+                Ctx& cx = ctxs[(size_t) g.ctx];
+                cx.busy = false;
+                cx.used = ++ctx_clock;
+                cx.held = g.rid;
+                pending.push_back(std::move(g.orig));
+                g.done = true;
+                gen_sweep();
+                return;
+            }
+            // the read ended before the stop took (it is checked between chunks only): the request goes on - left
+            // set, the flag cancelled it unanswered (finish "length", 0 tokens)
+            if (!asked) admit_stop.store(false);
+        }
         tag = std::to_string(g.rid) + " ";
         int rc = 0;
         if (e == "cancelled") {
@@ -2388,6 +2435,7 @@ static int glm_pack_generate(const Options& o) {
             return;
         }
         auto g = std::make_unique<Gen>();
+        g->orig = Pending{rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows, req_cp, req_gt};
         g->rid = rid;
         g->sp = rq;
         g->max_new = max_new;
@@ -2412,7 +2460,7 @@ static int glm_pack_generate(const Options& o) {
         int best = -1;
         size_t blen = 0;
         for (int c = 0; c < (int) ctxs.size(); ++c) {
-            if (ctxs[(size_t) c].busy || !fits(c)) continue;
+            if (ctxs[(size_t) c].busy || !fits(c) || (ctxs[(size_t) c].held >= 0 && ctxs[(size_t) c].held != rid)) continue;
             const auto& st = c == cur_ctx ? snap_tokens : ctxs[(size_t) c].snap_tokens;
             const uint64_t hh = c == cur_ctx ? snap_img_hash : ctxs[(size_t) c].snap_img_hash;
             if (!st.empty() && st.size() < g->prompt.size() && st.size() > blen &&
@@ -2423,7 +2471,7 @@ static int glm_pack_generate(const Options& o) {
         }
         if (best < 0)
             for (int c = 0; c < (int) ctxs.size(); ++c)
-                if (!ctxs[(size_t) c].busy && fits(c) &&
+                if (!ctxs[(size_t) c].busy && fits(c) && ctxs[(size_t) c].held < 0 &&
                     (best < 0 || ctxs[(size_t) c].used < ctxs[(size_t) best].used))
                     best = c;
         if (best < 0) {
@@ -2456,6 +2504,8 @@ static int glm_pack_generate(const Options& o) {
         g->images = !cur_img_pos.empty();
         model.force_next(-1);
         ctxs[(size_t) best].busy = true;
+        for (auto& cx : ctxs)   // (its paused read's context: taken back, or given up for another that holds more)
+            if (cx.held == rid) cx.held = -1;
         g->ctx = best;
         tag = std::to_string(rid) + " ";
         admit_stop.store(false);
@@ -2517,6 +2567,8 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             if (stopped) {
+                for (auto& cx : ctxs)
+                    if (cx.held == w.rid) cx.held = -1;
                 std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", w.rid, w.ids.size());
                 pending.erase(pending.begin() + (long) i);
                 continue;
@@ -2524,7 +2576,8 @@ static int glm_pack_generate(const Options& o) {
             const int64_t want = (int64_t) w.ids.size() + std::min<int64_t>(w.max_new, multi_room) + 8;
             bool free_fit = false;
             for (int c = 0; c < (int) ctxs.size(); ++c)
-                free_fit = free_fit || (!ctxs[(size_t) c].busy && model.seq_max_ctx(c) >= want);
+                free_fit = free_fit || (!ctxs[(size_t) c].busy && model.seq_max_ctx(c) >= want &&
+                                        (ctxs[(size_t) c].held < 0 || ctxs[(size_t) c].held == w.rid));
             if (!free_fit) {
                 ++i;
                 continue;
@@ -2991,6 +3044,27 @@ static int glm_pack_generate(const Options& o) {
     std::string line;
     bool trimmed = true;
     for (;;) {
+        if (multi) {   // (the Reader's share: someone decodes beside it)
+            bool dec = false;
+            for (const auto& gp : gens) dec = dec || (!gp->done && !gp->reading);
+            decoding_now.store(dec, std::memory_order_relaxed);
+        }
+        if (multi && reader && !reader_yield && read_slice_s > 0 && !pending.empty() && !admit_stop.load() &&
+            reader->part.size() > (size_t) std::max<int64_t>(1, model.prefill_chunk()) &&   // (one chunk: no stop)
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - reader->t0).count() >= read_slice_s) {
+            bool other = false;   // (one that an idle context can take now)
+            for (const auto& w : pending) {
+                const int64_t want = (int64_t) w.ids.size() + std::min<int64_t>(w.max_new, multi_room) + 8;
+                for (int c = 0; c < (int) ctxs.size() && !other; ++c)
+                    other = c != reader->g->ctx && !ctxs[(size_t) c].busy && model.seq_max_ctx(c) >= want &&
+                            (ctxs[(size_t) c].held < 0 || ctxs[(size_t) c].held == w.rid);
+                if (other) break;
+            }
+            if (other) {
+                reader_yield = true;
+                admit_stop.store(true);
+            }
+        }
         if (multi && !pending.empty()) admit_pending();
         if (multi && !gens.empty()) trimmed = false;
         else if (multi && !trimmed && model.elastic() && !in_lines_ready()) {
