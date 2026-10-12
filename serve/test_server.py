@@ -572,6 +572,32 @@ class LiveRate(unittest.TestCase):
                 self.svc.live.pop(902, None)
                 self.svc.status["busy"] = False
 
+    def test_each_request_and_a_stalled_one(self):
+        # several at once: each request has its own live rate and progress; one that has written nothing for longer
+        # than the window counts 0 (it fell back to its mean so far, so the total never came down)
+        now = time.time()
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True
+            self.svc.live[911] = {"key": 911, "phase": "answering", "generated": 50, "started": now - 30,
+                                  "first_token": now - 20, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "prompt_tokens": 1200, "rate": collections.deque([(now - 1, 40), (now, 50)], maxlen=32)}
+            self.svc.live[912] = {"key": 912, "phase": "thinking", "generated": 300, "started": now - 60,
+                                  "first_token": now - 50, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "prompt_tokens": 800, "rate": collections.deque([(now - 9, 290), (now - 8, 300)], maxlen=32)}
+        try:
+            live = self.metrics()["live"]
+            rs = {r["id"]: r for r in live["requests"]}
+            self.assertAlmostEqual(rs[911]["tok_s"], 10.0, delta=0.5)
+            self.assertEqual(rs[912]["tok_s"], 0.0)
+            self.assertEqual(rs[911]["prompt_tokens"], 1200)
+            self.assertAlmostEqual(live["tok_s"], 10.0, delta=0.5)
+            self.assertGreaterEqual(live["places"], 1)
+        finally:
+            with self.svc.status_lock:
+                self.svc.live.pop(911, None)
+                self.svc.live.pop(912, None)
+                self.svc.status["busy"] = False
+
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
 
