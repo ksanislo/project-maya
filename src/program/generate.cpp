@@ -1498,7 +1498,9 @@ static int glm_pack_generate(const Options& o) {
     // steps, and the state between them goes to a shared slot - the next conversation with the same system prompt (an
     // agent's other sessions and helpers) takes it back instead of reading it
     const auto cp_wanted = [&](const std::vector<int32_t>& prompt, size_t reuse, int64_t cp) -> bool {
-        if (slot_max <= 0 || !model.fast() || cp <= (int64_t) reuse || cp < std::max<int64_t>(1024, (int64_t) slot_min) ||
+        // (at least 64 tokens past what is reused: a shorter head is no prompt-path read - refused, it took the whole
+        // prompt to the token path, 8 tokens a step)
+        if (slot_max <= 0 || !model.fast() || cp < (int64_t) reuse + 64 || cp < std::max<int64_t>(1024, (int64_t) slot_min) ||
             cp >= (int64_t) prompt.size() - 1 || img_hash((size_t) cp) != kNoImages)
             return false;
         for (const auto& sl : slots)
@@ -1561,6 +1563,7 @@ static int glm_pack_generate(const Options& o) {
                         return !stop_req.load() && !admit_stop.load();
                     };
                 }
+                if (!pok && err.empty()) pok = true;   // the head refused, no error: the whole prompt in one read
             }
             if (pok) pok = model.prefill(part, err, prompt.back());   // (the NextN block's caches read it)
             model.prefill_progress = nullptr;
@@ -2339,7 +2342,10 @@ static int glm_pack_generate(const Options& o) {
             if (model.prefill_chunk() > 0 && g->prompt.size() - g->reuse > 1) {
                 g->cp = req_cp;
                 const bool cpw = cp_wanted(g->prompt, g->reuse, g->cp);
-                if (reader_start(g.get(), g->reuse, cpw ? (size_t) g->cp : g->prompt.size() - 1, cpw ? g->cp : 0)) {
+                bool started = reader_start(g.get(), g->reuse, cpw ? (size_t) g->cp : g->prompt.size() - 1, cpw ? g->cp : 0);
+                if (!started && cpw && err.empty())   // the head refused, no error: the whole prompt in one read
+                    started = reader_start(g.get(), g->reuse, g->prompt.size() - 1, 0);
+                if (started) {
                     tag.clear();
                     gens.push_back(std::move(g));
                     std::fprintf(stderr, "glm multi: request %d reads %zu prompt tokens beside %zu decoding\n", rid,
