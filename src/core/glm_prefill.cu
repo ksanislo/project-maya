@@ -2806,6 +2806,16 @@ bool Glm5Model::prefill_begin(int64_t n, int32_t next_token, bool background, st
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
+    // beside a decode (background): chunks of at most STRATA_GLM_PREFILL_BESIDE tokens (1024; 0: the full size) - a
+    // running kernel is not interrupted, so a smaller chunk lets the decode in between more often, and the prompt
+    // borrows less of the expert pool; the read is slower for it
+    if (background) {
+        static const int beside = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_BESIDE");
+            return v ? std::max(0, std::atoi(v) / 64 * 64) : 1024;
+        }();
+        if (beside > 0) Tmax = std::min(Tmax, std::max(64, beside));
+    }
     const int64_t nchunks = (n + Tmax - 1) / Tmax;
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
@@ -2905,9 +2915,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pf_->v.pos;
     // the chunks: Tc tokens each, the remainder last - and on a split, a long prompt opens and closes with a ramp of
-    // smaller chunks (512, 512, 1024 before 2048s on four parts): the parts take turns on a chunk, so the first ones
-    // keep a single card busy while the pipeline fills and the last ones while it drains; small chunks there shorten
-    // both. STRATA_GLM_PREFILL_RAMP=0: equal chunks only; STRATA_GLM_PREFILL_RAMP_MIN: the smallest (512)
+    // smaller chunks, halving from Tc / 2 down to STRATA_GLM_PREFILL_RAMP_MIN (512: 512, 1024 before 2048s; 64: 64,
+    // 128, ... 1024): the parts take turns on a chunk, so the first ones keep a single card busy while the pipeline
+    // fills and the last ones while it drains; small chunks there shorten both. STRATA_GLM_PREFILL_RAMP=0: equal only
     std::vector<int64_t> off{0};
     {
         static const bool ramp_on = [] { const char* v = getenv("STRATA_GLM_PREFILL_RAMP"); return !v || std::atoi(v) != 0; }();
@@ -2915,14 +2925,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const char* v = getenv("STRATA_GLM_PREFILL_RAMP_MIN");
             return v ? std::max(64, std::atoi(v) / 64 * 64) : 512;
         }();
-        int parts_n = 1;
-        for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) ++parts_n;
         std::vector<int64_t> ramp;
-        if (ramp_on && parts_n > 1)
-            for (int k = parts_n - 1; k >= 1; --k) {
-                const int t = std::max(ramp_min, (Tc >> k) / 64 * 64);
-                if (t < Tc) ramp.push_back(t);
-            }
+        if (ramp_on && split_next_ != nullptr)
+            for (int t = Tc / 2 / 64 * 64; t >= ramp_min; t = t / 2 / 64 * 64) ramp.insert(ramp.begin(), t);
         int64_t rs = 0;
         for (int64_t t : ramp) rs += t;
         const auto push = [&](int64_t t) { off.push_back(off.back() + t); };
