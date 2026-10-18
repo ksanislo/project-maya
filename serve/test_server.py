@@ -620,6 +620,54 @@ class PrometheusMetrics(unittest.TestCase):
             httpd.server_close()
 
 
+class ReplyOpening(unittest.TestCase):
+    """GEN gt=<n>: the prompt's last n tokens open the reply (the generation prompt) - the engine keeps the
+    conversation's state before them, so the next request continues it even when this answer is dropped."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+        cls.tmpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok, cls.tmpl)
+
+    def test_key(self):
+        self.assertIn("gt=3", StrataEngine.sampling_keys({"temperature": 0, "_gen_tail": 3}).split())
+        self.assertIn("gt=3", StrataEngine.sampling_keys({"temperature": 0.7, "_gen_tail": 3}).split())
+        for bad in (0, -1, True, 2.5, "3", None):
+            self.assertFalse([k for k in StrataEngine.sampling_keys({"_gen_tail": bad}).split() if k.startswith("gt=")],
+                             bad)
+
+    def test_gen_tail(self):
+        kw = {}
+        msgs = [{"role": "user", "content": "hello"}]
+        ids, _, _ = self.svc.prepare(msgs, None, kw)
+        n = kw.get("_gen_tail")
+        self.assertGreater(n, 0)
+        bare = self.svc.render_ids(msgs, None, {"add_generation_prompt": False})
+        self.assertEqual(ids[:len(ids) - n], bare)   # the state kept before the reply's opening: the history alone
+
+    def test_reaches_the_engine(self):
+        seen = {}
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                seen.update(sampling or {})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        svc = Service(Recording(self.tok, "ok", max_context=CTX), self.tok, self.tmpl)
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertGreater(seen.get("_gen_tail", 0), 0)
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
