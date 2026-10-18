@@ -4365,8 +4365,39 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pos_;
-    const int nc = (int) ((n + Tc - 1) / Tc);
-    const auto chunk_len = [&](int c) { return (int) std::min<int64_t>(Tc, n - (int64_t) c * Tc); };
+    // the chunks: Tc tokens each, the remainder last - and on a split, a long prompt opens and closes with a ramp of
+    // smaller chunks, halving from Tc / 2 down to STRATA_GLM_PREFILL_RAMP_MIN (512: 512, 1024 before 2048s; 64: 64,
+    // 128, ... 1024): the parts take turns on a chunk, so the first ones keep a single card busy while the pipeline
+    // fills and the last ones while it drains; small chunks there shorten both. STRATA_GLM_PREFILL_RAMP=0: equal only
+    std::vector<int64_t> off{0};
+    {
+        static const bool ramp_on = [] { const char* v = getenv("STRATA_GLM_PREFILL_RAMP"); return !v || std::atoi(v) != 0; }();
+        static const int ramp_min = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_RAMP_MIN");
+            return v ? std::max(64, std::atoi(v) / 64 * 64) : 512;
+        }();
+        std::vector<int64_t> ramp;
+        if (ramp_on && split_next_ != nullptr)
+            for (int t = Tc / 2 / 64 * 64; t >= ramp_min; t = t / 2 / 64 * 64) ramp.insert(ramp.begin(), t);
+        int64_t rs = 0;
+        for (int64_t t : ramp) rs += t;
+        const auto push = [&](int64_t t) { off.push_back(off.back() + t); };
+        if (!ramp.empty() && n >= 2 * rs + 2 * (int64_t) Tc) {
+            // the middle in full chunks (the kernels work in 64-row blocks: odd sizes pad every chunk); its rest goes
+            // into the closing ramp's first chunk when that stays within a full one, else one chunk of its own
+            for (int64_t t : ramp) push(t);
+            const int64_t mid = n - 2 * rs, full = mid / Tc, rest = mid % Tc;
+            for (int64_t i = 0; i < full; ++i) push(Tc);
+            std::vector<int64_t> tail(ramp.rbegin(), ramp.rend());
+            if (rest > 0 && tail[0] + rest <= Tc) tail[0] += rest;
+            else if (rest > 0) push(rest);
+            for (int64_t t : tail) push(t);
+        } else {
+            for (int64_t i = 0; i < n; i += Tc) push(std::min<int64_t>(Tc, n - i));
+        }
+    }
+    const int nc = (int) off.size() - 1;
+    const auto chunk_len = [&](int c) { return (int) (off[(size_t) c + 1] - off[(size_t) c]); };
     // the token after every position of chunk c (the draft block's caches read it): the prompt's own next token,
     // the caller's for the last position (-1: unknown - that position is filled by the first draft of the decode);
     // img: the image row standing for that token where it is an <|image|> (empty without images)
@@ -4376,7 +4407,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         img.clear();
         if (!img_pos_.empty()) img.assign((size_t) T, nullptr);
         for (int t = 0; t < T; ++t) {
-            const int64_t j = (int64_t) c * Tc + t + 1;
+            const int64_t j = off[(size_t) c] + t + 1;
             out[(size_t) t] = j < n ? tokens[(size_t) j] : prefill_next_;
             if (!img.empty() && j < n) img[(size_t) t] = image_row(pos_start + j);
         }
@@ -4385,7 +4416,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const auto embed = [&](int c) -> bool {
         PrefillState* S = pf_;
         const int T = chunk_len(c);
-        const int64_t i = (int64_t) c * Tc;
+        const int64_t i = off[(size_t) c];
         if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt embedding", err)) return false;
         for (int t = 0; t < T; ++t) {
             tt->to_float(pack_emb_src_ + (size_t) tokens[(size_t) (i + t)] * row_b, S->emb_h + (size_t) t * E, E);
@@ -4461,7 +4492,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // one half after the other, chunk by chunk
         for (int c = 0; c < nc; ++c) {
             const int T = chunk_len(c);
-            const int64_t p0 = pos_start + (int64_t) c * Tc;
+            const int64_t p0 = pos_start + off[(size_t) c];
             cudaSetDevice(dev_);
             if (!embed(c)) return false;
             std::vector<int32_t> nx0;
@@ -4558,7 +4589,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         if (stop) return;
                     }
                     const int T = chunk_len(c);
-                    const int64_t p0 = pos_start + (int64_t) c * Tc;
+                    const int64_t p0 = pos_start + off[(size_t) c];
                     if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
                     m->pf_->sev_hop = m->pf_->stages;   // (this chunk arrived over the hop: the line below reads it)
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
@@ -4593,7 +4624,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         return;
                     }
                     if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
+                        !prefill_progress(off[(size_t) c + 1], n)) {
                         fail("cancelled");
                         return;
                     }
@@ -4606,7 +4637,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 if (stop) break;
             }
             const int T = chunk_len(c);
-            const int64_t p0 = pos_start + (int64_t) c * Tc;
+            const int64_t p0 = pos_start + off[(size_t) c];
             if (!embed(c)) { fail(err); break; }
             std::string e1;
             pf_->chunk_i = c + 1;
