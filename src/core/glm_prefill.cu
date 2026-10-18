@@ -3407,6 +3407,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
         bool stop = false;
+        // a cancel stops the FIRST part before its next chunk and the later ones finish what it produced: every part
+        // ends at the same chunk boundary, a state the caller can keep (limit: the chunks that run)
+        int limit = nc;
+        std::atomic<bool> want_stop{false};
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
         const auto fail = [&](std::string e) {
@@ -3446,8 +3450,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 for (int c = 0; c < nc; ++c) {
                     {
                         std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop; });
-                        if (stop) return;
+                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop || c >= limit; });
+                        if (stop || (c >= limit && produced[(size_t) k - 1] <= c)) return;
                     }
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -3480,10 +3484,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         return;
                     }
                     if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
-                        fail("cancelled");
-                        return;
-                    }
+                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n))
+                        want_stop.store(true);
                 }
             });
         cudaSetDevice(dev_);
@@ -3491,6 +3493,12 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             {
                 std::lock_guard<std::mutex> lk(mu);
                 if (stop) break;
+                if (want_stop.load()) {
+                    limit = c;
+                    cancelled = true;
+                    cv.notify_all();
+                    break;
+                }
             }
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -3512,10 +3520,16 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 return false;
             }
         }
-        pos_ = pos_start + n;
+        pos_ = pos_start + std::min<int64_t>(n, (int64_t) limit * Tc);
         for (Glm5Model* m : parts) m->pos_ = pos_;
     }
-    if (cancelled) {
+    if (cancelled) {   // (the parts' streams first: the prefix the caller may keep must be complete on every card)
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            cudaStreamSynchronize(m->fast_->cs);
+            cudaStreamSynchronize(m->fast_->copy);
+        }
+        cudaSetDevice(dev_);
         err = "cancelled";
         return false;
     }
