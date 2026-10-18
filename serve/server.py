@@ -692,7 +692,8 @@ class StrataEngine:
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
-            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + bias_key
+            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + bias_key + \
+                StrataEngine.reply_key(sampling)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -728,7 +729,14 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling) + bias_key
+        return keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.reply_key(sampling)
+
+    @staticmethod
+    def reply_key(sampling: dict) -> str:
+        """`gt=<n>`: the prompt's last n tokens open the reply (prepare) - the engine keeps the conversation's state
+        before them, so the next request continues it even when this answer is cancelled or dropped from the history."""
+        v = (sampling or {}).get("_gen_tail")
+        return f" gt={v}" if isinstance(v, int) and not isinstance(v, bool) and v > 0 else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1748,6 +1756,14 @@ class Service:
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
+        # the reply's opening: the tokens the generation prompt (and a thinking-off close or a forced call) adds
+        given["_gen_tail"] = 0
+        try:
+            bare = self.render_ids(messages, tools, {**kwargs, "add_generation_prompt": False}, "")
+            if 0 < len(bare) < len(ids) and ids[:len(bare)] == bare:
+                given["_gen_tail"] = len(ids) - len(bare)
+        except Exception:   # a template that cannot render without the generation prompt: the last token only
+            pass
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -3051,6 +3067,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_gen_tail"):                            # the reply's opening (gt=)
+                req = {**req, "_gen_tail": kw["_gen_tail"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -3142,6 +3160,8 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            if kw.get("_gen_tail"):                            # the reply's opening (gt=)
+                req = {**req, "_gen_tail": kw["_gen_tail"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
