@@ -1999,15 +1999,26 @@ static int glm_pack_generate(const Options& o) {
                 i_first = snap_at;
                 pp_line(snap_at - reuse);
             } else if (err == "cancelled") {
-                // A CANCELLED READ keeps what it read: the longest checkpoint of this prompt the read has reached (one
-                // it kept itself, or an earlier one it started from) becomes the snapshot, so the client's retry - an
-                // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
-                // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
-                // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
+                // A CANCELLED READ keeps what it read, so the client's retry - an agent that gave up waiting and sends
+                // the same prompt again - or the next turn goes on from there.  The prompt path stops every part at the
+                // same chunk boundary: that state is kept as is; failing that, the longest checkpoint of this prompt the
+                // read has reached (#573).  Nothing read past what was restored: the restored conversation stays.
                 // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
                 static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                static const bool keep_exact = env_num("STRATA_GLM_KEEP_CANCELLED_EXACT", 1) != 0;   // (0: #573's alone)
                 size_t kept = 0;
-                if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                const int64_t pos = model.position();
+                const bool as_is = keep_cancelled && keep_exact && pos == (int64_t) reuse && reuse > 0;
+                if (keep_cancelled && keep_exact && model.fast() && pos > (int64_t) reuse && pos < (int64_t) prompt.size() &&
+                    model.snapshot_save()) {
+                    kept = (size_t) pos;
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) kept);
+                    snap_img_hash = img_hash(kept);
+                    snap_in_slot = false;
+                    ckpt_drop_past(kept);
+                    std::fprintf(stderr, "glm slots: a cancelled prompt keeps the %zu tokens it read (%zu new)\n", kept,
+                                 kept - reuse);
+                } else if (keep_cancelled && !as_is && ckpt_max > 0 && cur_img_pos.empty()) {
                     int best = -1;
                     for (int c = 0; c < (int) ckpts.size(); ++c) {
                         const auto& t = ckpts[(size_t) c].tokens;
@@ -2030,7 +2041,7 @@ static int glm_pack_generate(const Options& o) {
                                      ce.empty() ? "no snapshot" : ce.c_str());
                     }
                 }
-                if (kept == 0) {
+                if (kept == 0 && !as_is) {
                     snap_tokens.clear();
                     model.reset();
                     ckpt_drop_past(0);
