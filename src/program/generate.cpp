@@ -1670,7 +1670,8 @@ static int glm_pack_generate(const Options& o) {
         const size_t sys_cut = prefix_cut_on ? sys_end : 0;
         if (slot_max > 0 && cur_img_pos.empty())
             for (const size_t p : {sys_cut, div})
-                if (p >= std::max<size_t>(from + 64, (size_t) slot_min) && p + 64 <= end) at.push_back(p);
+                // (also just before the end: a short first question - the few tokens after go through the token path)
+                if (p >= std::max<size_t>(from + 64, (size_t) slot_min) && p < end) at.push_back(p);
         std::sort(at.begin(), at.end());
         at.erase(std::unique(at.begin(), at.end()), at.end());
         std::vector<size_t> kept;   // (every prompt-path call between them reaches its minimum)
