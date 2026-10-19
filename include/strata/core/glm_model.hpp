@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <condition_variable>
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -721,6 +722,43 @@ public:
         KvStream* kv = nullptr;   // KV streaming: its latent caches' host copy and maps (null: not streamed, or bound)
     };
     std::vector<SeqCtx> seq_;                              // empty: one sequence (the classic engine)
+    // ---- ELASTIC CONTEXTS (src/core/glm_multi.cu, STRATA_GLM_ELASTIC=1; CUDA virtual memory): every sequence's state
+    // reserves address space for the whole context, its fixed part (KDA states, index rings) backed at once and its
+    // context-sized DSA caches as positions are written, STRATA_GLM_ELASTIC_STEP tokens at a time, out of a budget per
+    // card that every sequence shares (STRATA_GLM_ELASTIC_KV_GB; default: one whole context's).  Every sequence can
+    // reach the whole context; the cards hold what the conversations hold, not what they might.
+    struct Elastic;
+    std::vector<Elastic*> el_;                             // per sequence; empty: static arenas
+    size_t el_budget_ = 0, el_backed_ = 0;                 // this part's budget for context-sized caches, backed now
+    std::mutex el_mu_;
+    bool elastic() const { return !el_.empty(); }
+    int seq_index() const { return seq_.empty() ? 0 : cur_seq_; }
+    // reserve (+ back the fixed part: state, rings, snapshots, when back_fixed); c's layout and snapshot pointers
+    bool el_create(int64_t ctx, SeqCtx& c, std::string& err, bool back_fixed = true);
+    bool seq_activate(int s, std::string& err);                   // this part: s's fixed part backed (a slot taken)
+    bool seq_active(int s) const;                                 // ... is it
+    bool seq_holds(int s) const;                                  // s holds memory (beyond the first slot's fixed part)
+    bool seq_grow(int s, int64_t tokens, std::string& err);       // this part: sequence s backs `tokens` positions
+    bool seq_grow_all(int s, int64_t tokens, std::string& err);   // ... every part
+    bool seq_can_grow(int s, int64_t tokens) const;               // every part: within the budget
+    void seq_release(int s, bool all = false);                    // every part: s's context-sized caches unbacked
+                                                                  // (all: its fixed part too - the slot is free)
+    int64_t seq_backed(int s) const;                              // positions s has backed (this part)
+    int64_t seq_pos(int s) const { return seq_.empty() || s == cur_seq_ ? pos_ : seq_[(size_t) s].pos; }
+    void el_destroy();
+    // ... and the expert pool they take from (STRATA_GLM_ELASTIC_POOL, on with STRATA_GLM_ELASTIC): its main slots
+    // are backed granule by granule, so a layer's top slots can be given up (lent, then unbacked) for a context's
+    // caches - the coldest layer top first - and taken back when the contexts let go
+    struct ElPool;
+    ElPool* elp_ = nullptr;
+    size_t el_budget0_ = 0;                                       // the budget before any expert gave way
+    uint8_t* el_pool_alloc(const std::vector<std::array<size_t, 3>>& layers, std::vector<size_t>& offs, std::string& err);
+    void el_pool_free();
+    bool pool_give(size_t bytes, std::string& err);               // this part: free `bytes` of expert slots for contexts
+    void pool_take_back();                                        // this part: slack beyond the base budget -> experts
+    bool seq_reserve_all(int s, int64_t tokens, std::string& err);   // every part: s backs `tokens`, experts give way
+    void pool_take_back_all();
+
     int cur_seq_ = 0;
     int seq_count() const { return seq_.empty() ? 1 : (int) seq_.size(); }
     int seq_bound() const { return cur_seq_; }
@@ -881,6 +919,7 @@ public:
     size_t pool_short_ = 0;                                // what that check found short of the reserve
     PoolBudget pool_b_;                                    // the budget the pool was carved from
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
+    bool lend_slots(const std::function<bool(int, int)>& sel, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)
     // this half's layers over a chunk (rows in pf_->R); next_ids / next_img: the NextN block's next tokens and, where
