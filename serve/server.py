@@ -228,6 +228,24 @@ def fair_slice_seconds() -> float:
         return 0.0
 
 
+def fair_read_seconds() -> float:
+    """STRATA_FAIR_READ_S: a prompt read this long while another request waits behind it (sent to the engine, nothing
+    heard from it yet) pauses at the engine's next chunk - the engine keeps what it read - and goes on with the rest
+    once that request has started (0, the default: a prompt is read to the end).  The design is upstream PR #144's."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_FAIR_READ_S", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def fair_read_yield_seconds() -> float:
+    """STRATA_FAIR_READ_YIELD_S: how long a paused prompt holds back at most for the requests it paused for (30)."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_FAIR_READ_YIELD_S", "30") or 0))
+    except ValueError:
+        return 30.0
+
+
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
@@ -428,6 +446,7 @@ class StrataEngine:
         self._routes_lock = threading.Lock()
         self._rids = itertools.count(1)
         self._tls = threading.local()                   # the request this thread is generating (pause())
+        self._sent: dict[int, list] = {}                # rid -> [sent at, heard anything] (fair reads: who waits)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
@@ -867,7 +886,9 @@ class StrataEngine:
         q: queue.Queue = queue.Queue()
         with self._routes_lock:
             self._routes[rid] = q
+            self._sent[rid] = [time.monotonic(), False]
         self._tls.rid = rid
+        self._tls.pp = None                 # this request's last prompt-progress report (fair reads)
         self.progress = None
         self.prefill_tok_s_mean = None
         tls = getattr(self, "_tls", None)
@@ -902,6 +923,9 @@ class StrataEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()
                 stall.clear()
+                with self._routes_lock:
+                    if rid in self._sent:
+                        self._sent[rid][1] = True
                 f = line.split()
                 if line.startswith("T "):
                     if cancel.is_set():
@@ -912,6 +936,7 @@ class StrataEngine:
                         self.progress = (int(f[2]), int(f[3]),
                                          int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
                                          float(f[4]) if len(f) >= 5 else 0.0)
+                        self._tls.pp = self.progress
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                         tls = getattr(self, "_tls", None)
                         if tls is not None:
@@ -942,7 +967,20 @@ class StrataEngine:
                         break
             with self._routes_lock:
                 self._routes.pop(rid, None)
+                self._sent.pop(rid, None)
             self._tls.rid = None
+
+    def waiting_behind(self, seconds: float) -> set:
+        """Several conversations: the other requests sent this long ago that have heard nothing yet (no token, no read
+        progress) - they wait behind this thread's prompt read."""
+        me, now = getattr(self._tls, "rid", None), time.monotonic()
+        with self._routes_lock:
+            return {r for r, (t, h) in self._sent.items() if r != me and not h and now - t >= seconds}
+
+    def started(self, rids) -> bool:
+        """Those requests have heard from the engine (their read began) or are gone."""
+        with self._routes_lock:
+            return all(r not in self._sent or self._sent[r][1] for r in rids)
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -1993,15 +2031,32 @@ class Service:
         whether this request holds the FIFO now.  Not for image prompts: their state is never kept in a slot."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
+        read_s = fair_read_seconds() if getattr(self.engine, "multi", 0) else 0.0
         while True:
             last0 = getattr(self.engine, "last", None)
             gen = self.engine.generate(cur, left, smp, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, left, smp, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
+            t_read, paused_for = None, set()            # fair reads: the first chunk report's time, who it paused for
             try:
                 for t in gen:
                     yield t
                     if t is None:
+                        # STRATA_FAIR_READ_S: this prompt read that long (from its first chunk report: a request
+                        # queued behind another's read never pauses its own), someone waiting behind it - PAUSE: the
+                        # engine stops at a chunk boundary and keeps what it read; the rest after they started
+                        pp = getattr(getattr(self.engine, "_tls", None), "pp", None)
+                        if pp and t_read is None:
+                            t_read = time.monotonic()
+                        if read_s > 0 and t0 is None and not pausing and not emb and not self.stopping and pp \
+                                and pp[0] < pp[1] and time.monotonic() - t_read >= read_s \
+                                and getattr(self.engine, "can_pause", False):
+                            paused_for = self.engine.waiting_behind(2.0)
+                            if paused_for:
+                                self.engine.pause()
+                                pausing = True
+                                print(f"[maya] fair read: {pp[0]:,} of {pp[1]:,} prompt tokens read, paused for "
+                                      f"{len(paused_for)} waiting request(s); the rest after they started", flush=True)
                         continue
                     produced.append(t)
                     if t0 is None:
@@ -2056,6 +2111,12 @@ class Service:
                 self.active += 1
                 hold[1] = True
                 self.status["busy"] = True
+            if paused_for:   # a paused read: back once the requests it paused for have started (else the engine
+                until = time.monotonic() + fair_read_yield_seconds()   # takes it up at once, ahead of them)
+                while time.monotonic() < until and not self.stopping and not cancel.is_set() \
+                        and not self.engine.started(paused_for):
+                    yield None
+                    time.sleep(0.25)
             if self.stopping or cancel.is_set():
                 break
             if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
@@ -3326,7 +3387,8 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S",
+              "STRATA_FAIR_READ_S", "STRATA_FAIR_READ_YIELD_S")
 
 
 def apply_server_env(cfg: dict) -> None:
