@@ -306,6 +306,23 @@ void blas_ck(cublasStatus_t st, const char* what) {
 
 struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
+    // the sequence a prompt reads: its state's layout and position, copied at prefill_begin, so the decode may bind
+    // other sequences while the prompt runs (STRATA_GLM_SEQS); and the prompt's own stream (the decode's has the
+    // higher priority)
+    struct View {
+        int seq = -1;
+        float* state = nullptr;
+        int64_t pos = 0, max_ctx = 0;
+        int ik_ring = 0;
+        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool, img_pos;
+        std::vector<float> img_rows;
+        const float* image_row(int64_t p, int E) const {
+            const auto it = std::lower_bound(img_pos.begin(), img_pos.end(), p);
+            if (it == img_pos.end() || *it != p) return nullptr;
+            return img_rows.data() + (size_t) (it - img_pos.begin()) * (size_t) E;
+        }
+    } v;
+    cudaStream_t cs = nullptr;
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
     std::function<std::pair<int64_t, int>(int64_t)> choose;
@@ -807,7 +824,17 @@ bool Glm5Model::prefill_setup(std::string& err) {
         prefill_destroy();
         return true;
     }
-    cublasSetStream(S->blas, F->cs);
+    {
+        int least = 0, greatest = 0;
+        cudaDeviceGetStreamPriorityRange(&least, &greatest);
+        if (cudaStreamCreateWithPriority(&S->cs, cudaStreamNonBlocking, least) != cudaSuccess) {
+            std::fprintf(stderr, "glm prefill: CUDA%d its stream did not create - token by token\n", dev_);
+            prefill_destroy();
+            return true;
+        }
+        F->pf_cs = S->cs;
+    }
+    cublasSetStream(S->blas, S->cs);
     cublasSetMathMode(S->blas, CUBLAS_DEFAULT_MATH);
     S->mq = std::make_unique<mmq::Context>();
     // an event that did not create (a GPU the expert pool filled) stays null and the prompt runs token by token:
@@ -1245,7 +1272,8 @@ bool Glm5Model::prefill_return(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || !S->lent) return true;
     cudaSetDevice(dev_);
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
+    if ((S->cs && !glmfast::cuda_ok(cudaStreamSynchronize(S->cs), "glm return prompt", err)) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
         !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err) ||
         (S->kv_ss && !glmfast::cuda_ok(cudaStreamSynchronize(S->kv_ss), "glm return KV stage", err))) return false;
     S->kv_next = -1;   // (a prompt that ended early leaves a staged layer nobody waits for)
@@ -1302,6 +1330,11 @@ void Glm5Model::prefill_destroy() {
     }
     if (S->kv_ready) cudaEventDestroy(S->kv_ready);
     if (S->kv_free) cudaEventDestroy(S->kv_free);
+    if (S->cs) {
+        cudaStreamSynchronize(S->cs);
+        cudaStreamDestroy(S->cs);
+        if (fast_) fast_->pf_cs = nullptr;
+    }
     S->mq.reset();
     if (S->blas) cublasDestroy(S->blas);
     for (int b = 0; b < PrefillState::NG; ++b) {
@@ -1329,7 +1362,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     FastState* F = fast_;
     PrefillState* S = pf_;
     const Glm5Geometry& g = g_;
-    const cudaStream_t s = F->cs;
+    const cudaStream_t s = S->cs;
+    const PrefillState::View& V = S->v;
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
 
@@ -1355,7 +1389,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (getenv("STRATA_HIPBLASLT_TUNING")) {
                 auto lt = std::make_unique<strata::prefill::Gemm>();
                 std::string lt_err;
-                if (lt->init_external(F->cs, S->w16, S->w16_elems, S->ws, S->ws_bytes, lt_err))
+                if (lt->init_external(S->cs, S->w16, S->w16_elems, S->ws, S->ws_bytes, lt_err))
                     S->lt = std::move(lt);
                 else
                     std::fprintf(stderr, "glm prefill: hipBLASLt GEMM unavailable (%s)\n", lt_err.c_str());
@@ -1741,7 +1775,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->mark("kv_stage", s);
             }
         }
-        uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+        uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (V.state + V.dsa_lat[(size_t) il]);
 
         // ---- the mixer, in sub-batches of S->sub tokens (the recurrences carry their state across)
         for (int t0 = 0; t0 < T; t0 += S->sub) {
@@ -1760,14 +1794,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f);
                 const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
-                float* cst = state_ + kda_conv_[(size_t) il];
+                float* cst = V.state + V.kda_conv[(size_t) il];
                 gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
                 gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
                 S->mark("kda_proj", s);
                 gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
-                            state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                            V.state + V.kda_S[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
             } else {
@@ -1791,7 +1825,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.lat = lat;
                 if (kv_host != nullptr) {
                     d.lat_host = (uint16_t*) kv_host;
-                    d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                    d.lat_slots = (uint16_t*) (V.state + V.dsa_lat[(size_t) il]);
                     d.lat_table = kv_->map[(size_t) il].page_table;
                     d.lat_page = kv_->page;
                 }
@@ -1800,11 +1834,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.ik_raw = B.ik_raw;
                 d.k_norm_w = Ly.k_norm_w;
                 d.k_norm_b = Ly.k_norm_b;
-                d.ik_cache = state_ + dsa_ik_[(size_t) il];
+                d.ik_cache = V.state + V.dsa_ik[(size_t) il];
                 d.ig_raw = B.ig_raw;
-                d.ig_cache = state_ + dsa_ig_[(size_t) il];
+                d.ig_cache = V.state + V.dsa_ig[(size_t) il];
                 d.idx_key = g.idx_key;
-                d.ring = ik_ring_;
+                d.ring = V.ik_ring;
                 d.p0 = pt;
                 d.T = tn;
                 d.eps = g.norm_eps;
@@ -1813,9 +1847,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const int kp = g.idx_kpool;
                 const int pool_lo = (pt + kp) / kp - 1, pool_hi = (pt + tn) / kp - 1;
                 if (pool_hi >= pool_lo)
-                    gb::dsa_pool(state_ + dsa_ik_[(size_t) il], state_ + dsa_ig_[(size_t) il], Ly.ape,
-                                 state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
-                                 ik_ring_);
+                    gb::dsa_pool(V.state + V.dsa_ik[(size_t) il], V.state + V.dsa_ig[(size_t) il], Ly.ape,
+                                 V.state + V.dsa_pool[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
+                                 V.ik_ring);
                 hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
                 if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
                     hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
@@ -1826,7 +1860,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->mark("dsa_proj", s);
                 const int max_vis = (pt + tn) / kp;
                 if (max_vis > g.top_pools_max())
-                    gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
+                    gb::dsa_score(B.iq, V.state + V.dsa_pool[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
                                   max_vis, B.score, B.score_ld, s);
                 gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn, g.n_sel_max(),
                                B.cells, B.n_sel, s);
@@ -2010,7 +2044,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
         }
 
-        // ---- the plan (host): resident experts in slot order, then the staged ones in groups
+        // ---- the plan (host): resident experts in slot order, then the staged ones in groups.  A prompt beside the
+        // decode (prefill_begin's background) holds the plan lock until this layer's work is queued: the decode's
+        // boundary takes it, then waits for the prompt's stream, before it moves any expert the plan picked
+        std::unique_lock<std::mutex> plan_lk(F->plan_mu, std::defer_lock);
+        if (F->pf_bg.load(std::memory_order_acquire)) plan_lk.lock();
         auto& P = F->lp[(size_t) il];
         auto& RC = F->rc[(size_t) F->layer_rc[(size_t) il]];
         struct Staged {
@@ -3043,11 +3081,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             gb::DsaPrepArgs d;
             d.kv_raw = kv;
             d.kv_norm = Ly.kv_a_norm;
-            d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+            d.lat = (uint16_t*) (V.state + V.dsa_lat[(size_t) mtp_il_]);
             if (kv_ != nullptr && kv_->host[(size_t) mtp_il_] != nullptr) {   // KV streaming: no attention here, no stage
                 d.lat = nullptr;
                 d.lat_host = (uint16_t*) kv_->host[(size_t) mtp_il_];
-                d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                d.lat_slots = (uint16_t*) (V.state + V.dsa_lat[(size_t) mtp_il_]);
                 d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
                 d.lat_page = kv_->page;
             }
@@ -3056,16 +3094,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             d.ik_raw = ik;
             d.k_norm_w = Ly.k_norm_w;
             d.k_norm_b = Ly.k_norm_b;
-            d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
+            d.ik_cache = V.state + V.dsa_ik[(size_t) mtp_il_];
             d.ig_raw = ig;
-            d.ig_cache = state_ + dsa_ig_[(size_t) mtp_il_];
+            d.ig_cache = V.state + V.dsa_ig[(size_t) mtp_il_];
             d.idx_key = g.idx_key;
-            d.ring = ik_ring_;
+            d.ring = V.ik_ring;
             d.eps = g.norm_eps;
             // in pieces the indexer's key / gate ring holds with the open pool before them (a one-GPU chunk is up to
             // 32K positions, the ring ~8K): each piece's rows are pooled before the next one overwrites the ring
             const int kp = g.idx_kpool;
-            const int piece = std::max(kp, ik_ring_ - 64);
+            const int piece = std::max(kp, V.ik_ring - 64);
             for (int t0 = 0; t0 < Tv; t0 += piece) {
                 const int tn = std::min(piece, Tv - t0);
                 d.kv_raw = kv + (size_t) t0 * g.kv_lora;
@@ -3076,9 +3114,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 gb::dsa_prep(d, s);
                 const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
                 if (pool_hi >= pool_lo)
-                    gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
-                                 state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
-                                 ik_ring_);
+                    gb::dsa_pool(V.state + V.dsa_ik[(size_t) mtp_il_], V.state + V.dsa_ig[(size_t) mtp_il_], Ly.ape,
+                                 V.state + V.dsa_pool[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
+                                 V.ik_ring);
             }
             S->mark("mtp_cache", s);
         }
@@ -3140,21 +3178,44 @@ bool Glm5Model::dump_state(const std::string& path) {
 
 // ---------------------------------------------------------------- the prompt
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
+    if (!prefill_begin((int64_t) tokens.size(), next_token, false, err)) return false;
+    bool ok = prefill_run(tokens, err);
+    std::string end_err;
+    if (!prefill_finish(end_err) && ok) {
+        err = end_err;
+        ok = false;
+    }
+    return ok;
+}
+
+// The prompt's start (the caller's thread, nothing else on the parts): each part takes the bound sequence's layout
+// (its View), carves for the chunk and lends the pool's tail.  background: prefill_run will run beside the decode
+// (another thread; the decode binds other sequences meanwhile) - the plan lock is on until prefill_finish.
+bool Glm5Model::prefill_begin(int64_t n, int32_t next_token, bool background, std::string& err) {
     err.clear();
     prefill_next_ = next_token;
-    if (fast_ == nullptr || tokens.empty()) return false;
+    if (fast_ == nullptr || n <= 0) return false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
         if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch)
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
-    if ((int64_t) tokens.size() < min_n) return false;
+    if (n < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size();
-    int64_t nchunks = (nn + Tmax - 1) / Tmax;
+    // beside a decode (background): chunks of at most STRATA_GLM_PREFILL_BESIDE tokens (1024; 0: the full size) - a
+    // running kernel is not interrupted, so a smaller chunk lets the decode in between more often, and the prompt
+    // borrows less of the expert pool; the read is slower for it
+    if (background) {
+        static const int beside = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_BESIDE");
+            return v ? std::max(0, std::atoi(v) / 64 * 64) : 1024;
+        }();
+        if (beside > 0) Tmax = std::min(Tmax, std::max(64, beside));
+    }
+    int64_t nchunks = (n + Tmax - 1) / Tmax;
     // a split pipelines the chunks (part k on chunk c while part k - 1 is on c + 1): a prompt in fewer chunks than
     // parts keeps one card busy at a time - it goes in one chunk per part instead, none under
     // STRATA_GLM_PREFILL_MIN_CHUNK tokens (512). The idea and its measurements: upstream PR #138
@@ -3165,17 +3226,33 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         }();
         int64_t parts = 1;
         for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) ++parts;
-        nchunks = std::max(nchunks, std::min(parts, (nn + min_chunk - 1) / min_chunk));
+        nchunks = std::max(nchunks, std::min(parts, (n + min_chunk - 1) / min_chunk));
     }
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (n + 63) / 64 * 64)
+                                            : (int) std::min<int64_t>(Tmax, ((n + nchunks - 1) / nchunks + 63) / 64 * 64);
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        PrefillState::View& v = m->pf_->v;
+        v.seq = m->seq_.empty() ? -1 : m->cur_seq_;
+        v.state = m->state_;
+        v.pos = m->pos_;
+        v.max_ctx = m->max_ctx_;
+        v.ik_ring = m->ik_ring_;
+        v.kda_S = m->kda_S_;
+        v.kda_conv = m->kda_conv_;
+        v.dsa_lat = m->dsa_lat_;
+        v.dsa_ik = m->dsa_ik_;
+        v.dsa_ig = m->dsa_ig_;
+        v.dsa_pool = m->dsa_pool_;
+        v.img_pos = m->img_pos_;
+        v.img_rows = m == this ? m->img_rows_ : std::vector<float>();   // (only the first part embeds)
+    }
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun, pos_ + nn);
+        m->prefill_carve(Trun, pos_ + n);
         if (!m->prefill_lend(err)) { ok = false; break; }
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
@@ -3187,12 +3264,28 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         progress_at("the prompt: STRATA_GLM_STALL_TEST's pause");
         std::this_thread::sleep_for(std::chrono::seconds(stall_test));
     }
+    if (!ok) {
+        std::string end_err;
+        prefill_finish(end_err);
+        if (err.empty()) err = "glm prefill: the tail did not lend";
+        return false;
+    }
     // a DFlash drafter reads only the prompt's last positions (its window): the captures start there
-    if (ok && dflash_ready()) {
-        const int64_t end = pos_ + (int64_t) tokens.size() + (next_token >= 0 ? 1 : 0);
+    if (dflash_ready()) {
+        const int64_t end = pos_ + n + (next_token >= 0 ? 1 : 0);
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cap_floor_ = end - cap_d_->ctx();
     }
-    if (ok) ok = prefill_run(tokens, err);
+    if (background)
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->fast_->pf_bg.store(true, std::memory_order_release);
+    cudaSetDevice(dev_);
+    return true;
+}
+
+// ... and its end (the caller's thread, the prompt's thread joined): the tail goes back, the plan lock off, and the
+// sequence's position moves to where the prompt left it - the bound one's, or the one kept for it if the decode
+// bound another meanwhile
+bool Glm5Model::prefill_finish(std::string& err) {
+    bool ok = true;
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
@@ -3201,6 +3294,13 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             if (ok) err = return_err;
             ok = false;
         }
+        m->fast_->pf_bg.store(false, std::memory_order_release);
+        PrefillState::View& v = m->pf_->v;
+        if (v.state != nullptr) {
+            if (m->seq_.empty() || m->cur_seq_ == v.seq) m->pos_ = v.pos;
+            else m->seq_[(size_t) v.seq].pos = v.pos;
+        }
+        v = PrefillState::View{};
     }
     cudaSetDevice(dev_);
     return ok;
@@ -3298,9 +3398,9 @@ bool Glm5Model::dual_prefill_ready() {
 bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err) {
     const Glm5Geometry& g = g_;
     const int64_t n = (int64_t) tokens.size();
-    if (pos_ + n > max_ctx_) {
-        err = "glm prefill: the prompt (" + std::to_string(pos_ + n) + " positions) exceeds the context (" +
-              std::to_string(max_ctx_) + ")";
+    if (pf_->v.pos + n > pf_->v.max_ctx) {
+        err = "glm prefill: the prompt (" + std::to_string(pf_->v.pos + n) + " positions) exceeds the context (" +
+              std::to_string(pf_->v.max_ctx) + ")";
         return false;
     }
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -3313,7 +3413,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
-    const int64_t pos_start = pos_;
+    const int64_t pos_start = pf_->v.pos;
     // the chunks: Tc tokens each, the remainder last - and on a split, a long prompt opens and closes with a ramp of
     // smaller chunks, halving from Tc / 2 down to STRATA_GLM_PREFILL_RAMP_MIN (512: 512, 1024 before 2048s; 64: 64,
     // 128, ... 1024): the parts take turns on a chunk, so the first ones keep a single card busy while the pipeline
@@ -3354,11 +3454,11 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         const int T = chunk_len(c);
         out.resize((size_t) T);
         img.clear();
-        if (!img_pos_.empty()) img.assign((size_t) T, nullptr);
+        if (!pf_->v.img_pos.empty()) img.assign((size_t) T, nullptr);   // (the prompt's own pictures: its View)
         for (int t = 0; t < T; ++t) {
             const int64_t j = off[(size_t) c] + t + 1;
             out[(size_t) t] = j < n ? tokens[(size_t) j] : prefill_next_;
-            if (!img.empty() && j < n) img[(size_t) t] = image_row(pos_start + j);
+            if (!img.empty() && j < n) img[(size_t) t] = pf_->v.image_row(pos_start + j, E);
         }
     };
     // chunk c's embedding rows into this half's R (host-dequantized from the shard mapping)
@@ -3366,15 +3466,15 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         PrefillState* S = pf_;
         const int T = chunk_len(c);
         const int64_t i = off[(size_t) c];
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt embedding", err)) return false;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(S->cs), "glm prompt embedding", err)) return false;
         for (int t = 0; t < T; ++t) {
             tt->to_float(pack_emb_src_ + (size_t) tokens[(size_t) (i + t)] * row_b, S->emb_h + (size_t) t * E, E);
-            if (const float* img = image_row(pos_start + i + t))   // an image's row in place of its <|image|> token
+            if (const float* img = S->v.image_row(pos_start + i + t, E))   // an image's row in place of its <|image|> token
                 std::memcpy(S->emb_h + (size_t) t * E, img, (size_t) E * sizeof(float));
         }
         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
-        cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
-        gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+        cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, S->cs);
+        gb::embed_rows(S->x, S->R, T, E, S->cs);
         return true;
     };
     std::vector<Glm5Model*> parts;
@@ -3420,12 +3520,12 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 PrefillState* SP = prev->pf_;
                 const size_t hop = (size_t) T * 4 * E * sizeof(float);
                 cudaSetDevice(prev->dev_);
-                cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
-                cudaEventRecord(SP->ev_hop, prev->fast_->cs);
+                cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, SP->cs);
+                cudaEventRecord(SP->ev_hop, SP->cs);
                 cudaSetDevice(m->dev_);
-                cudaStreamWaitEvent(m->fast_->cs, SP->ev_hop, 0);
-                cudaMemcpyAsync(m->pf_->R, SP->hop_h, hop, cudaMemcpyHostToDevice, m->fast_->cs);
-                m->pos_ = p0;
+                cudaStreamWaitEvent(m->pf_->cs, SP->ev_hop, 0);
+                cudaMemcpyAsync(m->pf_->R, SP->hop_h, hop, cudaMemcpyHostToDevice, m->pf_->cs);
+                m->pf_->v.pos = p0;
                 std::vector<int32_t> nx;
                 std::vector<const float*> im;
                 if (m->mtp_il_ >= 0) next_of(c, nx, im);
@@ -3434,10 +3534,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     return false;
                 prev = m;
             }
-            pos_ = p0 + T;
-            for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pf_->v.pos = p0 + T;
             ++pf_->chunks;
-            if (prefill_progress && c + 1 < nc && !prefill_progress(pos_ - pos_start, n)) {
+            if (prefill_progress && c + 1 < nc && !prefill_progress(p0 + T - pos_start, n)) {
                 cancelled = true;
                 break;
             }
@@ -3472,9 +3571,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 if (stop) return false;
             }
             cudaMemcpyAsync(m->pf_->hop_h + (size_t) (c & 1) * slot, m->pf_->R, (size_t) T * 4 * E * sizeof(float),
-                            cudaMemcpyDeviceToHost, m->fast_->cs);
+                            cudaMemcpyDeviceToHost, m->pf_->cs);
             std::string e;
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop out", e)) {
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(m->pf_->cs), "glm prompt hop out", e)) {
                 fail(e);
                 return false;
             }
@@ -3500,9 +3599,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + off[(size_t) c];
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
-                                    (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
+                                    (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->pf_->cs);
                     std::string e2;
-                    if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
+                    if (!glmfast::cuda_ok(cudaStreamSynchronize(m->pf_->cs), "glm prompt hop in", e2)) {
                         fail(e2);
                         return;
                     }
@@ -3511,7 +3610,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         consumed[(size_t) k - 1] = c + 1;
                     }
                     cv.notify_all();
-                    m->pos_ = p0;
+                    m->pf_->v.pos = p0;
                     std::vector<int32_t> nx;
                     std::vector<const float*> im;
                     if (m->mtp_il_ >= 0) next_of(c, nx, im);
@@ -3523,7 +3622,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         if (!hand_on(k, c, T)) return;
                         continue;
                     }
-                    if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
+                    if (!glmfast::cuda_ok(cudaStreamSynchronize(m->pf_->cs), "glm prompt pipeline", e2)) {
                         fail(e2);
                         return;
                     }
@@ -3564,8 +3663,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 return false;
             }
         }
-        pos_ = pos_start + off[(size_t) limit];
-        for (Glm5Model* m : parts) m->pos_ = pos_;
+        for (Glm5Model* m : parts) m->pf_->v.pos = pos_start + off[(size_t) limit];
     }
     if (cancelled) {   // (the parts' streams first: the prefix the caller may keep must be complete on every card)
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -3579,7 +3677,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prefill compute", err) ||
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->pf_->cs), "glm prefill compute", err) ||
             !glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->copy), "glm prefill copies", err)) {
             cudaSetDevice(dev_);
             return false;
