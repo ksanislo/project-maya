@@ -1832,9 +1832,21 @@ static int glm_pack_generate(const Options& o) {
                 i_first = prompt.size() - 1;
                 pp_line(prompt.size() - 1 - reuse);
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
-                ckpt_drop_past(0);
+                // the state stands at a chunk boundary (every part stops at the same one): kept as the conversation's
+                // snapshot, so the request that follows (a retry, the next turn) reads only the rest
+                const int64_t kept = model.position();
+                if (model.fast() && kept > (int64_t) reuse && kept < (int64_t) prompt.size() && model.snapshot_save()) {
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + kept);
+                    snap_img_hash = img_hash(snap_tokens.size());
+                    snap_in_slot = false;
+                    ckpt_drop_past((size_t) kept);
+                    std::fprintf(stderr, "glm slots: a cancelled prompt keeps the %lld tokens it read (%zu new)\n",
+                                 (long long) kept, (size_t) kept - reuse);
+                } else if (!(kept == (int64_t) reuse && reuse > 0)) {   // (nothing read past what was restored: as is)
+                    snap_tokens.clear();
+                    model.reset();
+                    ckpt_drop_past(0);
+                }
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
