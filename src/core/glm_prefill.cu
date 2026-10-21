@@ -4146,7 +4146,20 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    const int64_t nn = (int64_t) tokens.size();
+    int64_t nchunks = (nn + Tmax - 1) / Tmax;
+    // a split pipelines the chunks (part k on chunk c while part k - 1 is on c + 1): a prompt in fewer chunks than
+    // parts keeps one card busy at a time - it goes in one chunk per part instead, none under
+    // STRATA_GLM_PREFILL_MIN_CHUNK tokens (512). The idea and its measurements: upstream PR #138
+    if (split_next_ != nullptr) {
+        static const int64_t min_chunk = [] {
+            const char* v = getenv("STRATA_GLM_PREFILL_MIN_CHUNK");
+            return v ? std::max<int64_t>(64, std::atoll(v)) : 512;
+        }();
+        int64_t parts = 1;
+        for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) ++parts;
+        nchunks = std::max(nchunks, std::min(parts, (nn + min_chunk - 1) / min_chunk));
+    }
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
     const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
