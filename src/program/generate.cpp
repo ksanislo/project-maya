@@ -2826,7 +2826,7 @@ static int glm_pack_generate(const Options& o) {
     // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic
     // prompts of <prompt> tokens, then <gen> greedy tokens each - sequence 0 alone through the token path first (the
     // reference), then all n through the selected together, split-rows or pipelined path; prints both rates and whether
-    // same tokens both ways.
+    // sequence 0 wrote the same tokens both ways - and every other sequence against its own run alone.
     if (const char* mb = getenv("STRATA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
         std::sscanf(mb, "%d,%d,%d,%d,%d", &n, &L, &G, &K, &same_prompt);
@@ -2894,6 +2894,19 @@ static int glm_pack_generate(const Options& o) {
             st_b = model.fast_stats();
         }
         const strata::core::Glm5Model::FastStats solo_a = st_a, solo_b = st_b;
+        // every other sequence alone too: its own reference
+        std::vector<std::vector<int>> solos((size_t) n);
+        solos[0] = solo;
+        for (int s = 1; s < n; ++s) {
+            model.seq_bind_all(s);
+            model.snapshot_restore();
+            if (!model.forward({prompts[(size_t) s].back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
+            solos[(size_t) s].push_back(model.last_tok_);
+            while ((int) solos[(size_t) s].size() < G) {
+                if (!model.forward({(int32_t) solos[(size_t) s].back()}, lg, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
+                solos[(size_t) s].push_back(model.last_tok_);
+            }
+        }
         // all n through the pipelined decode
         std::vector<std::vector<int>> out((size_t) n);
         for (int s = 0; s < n; ++s) {
@@ -3027,9 +3040,14 @@ static int glm_pack_generate(const Options& o) {
         };
         const size_t same = agree(solo, out[0]);
         std::printf("  solo vs its untimed warm-up run: %zu of %zu agree\n", agree(solo, solo2), solo.size());
-        for (int s = 1; s < n; ++s)
-            std::printf("  seq %d vs seq 0: %zu agree, vs solo: %zu\n", s, agree(out[(size_t) s], out[0]),
-                        agree(out[(size_t) s], solo));
+        bool all_same = true;
+        for (int s = 1; s < n; ++s) {
+            const size_t own = agree(out[(size_t) s], solos[(size_t) s]);
+            all_same = all_same && own == solos[(size_t) s].size();
+            std::printf("  seq %d vs seq 0: %zu agree, vs solo: %zu, vs its own run alone: %zu of %zu\n", s,
+                        agree(out[(size_t) s], out[0]), agree(out[(size_t) s], solo), own, solos[(size_t) s].size());
+        }
+        std::printf("  every sequence wrote its own run's tokens: %s\n", all_same && same == solo.size() ? "yes" : "NO");
         std::printf("MULTI BENCH %d seqs, prompt %d, %d tokens each: solo %.1f tok/s | %s %.1f tok/s total, "
                     "%.1f per sequence (%d boundaries) | sequence 0 same tokens: %zu of %zu\n", n, L, G,
                     (G - 1) / solo_s, path, (double) n * (G - 1) / multi_s,
