@@ -4193,8 +4193,17 @@ int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
         return s;
     }();
     if (split_next_ == nullptr) return 1;
-    return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
-                    strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
+    // a prompt in fewer chunks than parts keeps one card busy at a time: one chunk per part, none under
+    // STRATA_GLM_PREFILL_MIN_CHUNK tokens (512). The idea and its measurements: upstream PR #138
+    static const int64_t min_chunk = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_MIN_CHUNK");
+        return v ? std::max<int64_t>(64, std::atoll(v)) : 512;
+    }();
+    int64_t parts = 1;
+    for (const Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) ++parts;
+    const int64_t per_part = std::min(parts, (nn + min_chunk - 1) / min_chunk);
+    return std::max({per_part, strata::core::prefill_floor_chunks(nn, call_min, 256),
+                     strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens)});
 }
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
