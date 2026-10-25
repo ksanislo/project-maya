@@ -1733,10 +1733,12 @@ static int glm_pack_generate(const Options& o) {
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
     std::chrono::steady_clock::time_point gap_mark;   // the read's start (after any restore), then each gap's end
-    const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
-                                 std::chrono::steady_clock::time_point& t0) -> int {
-        // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
-        // restored when this prompt extends it - a chat's next turn reads only what is new
+    // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is restored
+    // when this prompt extends it - a chat's next turn reads only what is new; else a checkpoint or a slot that holds
+    // it, else a reset.  The tokens the state already holds.
+    size_t restore_div = 0;   // prep_restore's: where the prompt parts from a kept conversation (0: nowhere)
+    const auto prep_restore = [&](const std::vector<int32_t>& prompt) -> size_t {
+        size_t reuse = 0;
         strata::core::progress_at("the request: restoring a conversation");
         size_t lcp = 0, lcp_of = 0;   // the longest prefix this prompt shares with a kept conversation, and its length
         const auto lcp_with = [&](const std::vector<int32_t>& t) {
@@ -1751,6 +1753,7 @@ static int glm_pack_generate(const Options& o) {
         lcp_with(snap_tokens);
         if (each_ctx_snap) each_ctx_snap(lcp_with);
         const size_t div = lcp < lcp_of ? lcp : 0;   // where it parts from one that goes on differently
+        restore_div = div;
         const bool snap_ok = model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
                              img_hash(snap_tokens.size()) == snap_img_hash && getenv("STRATA_GLM_NO_REUSE") == nullptr;
@@ -1824,12 +1827,54 @@ static int glm_pack_generate(const Options& o) {
             std::fprintf(stderr, "glm slots: nothing kept continues this %zu-token prompt; the closest (%zu tokens) shares "
                          "its first %zu\n", prompt.size(), lcp_of, lcp);
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
+        return reuse;
+    };
+    // the prompt from token i on through the token path, the state saved before its LAST token (an identical or
+    // extending prompt can reuse it) - after the batched path, only that last token is left
+    const auto prep_tail = [&](const std::vector<int32_t>& prompt, size_t i_first, size_t reuse, const char*& finish,
+                               std::chrono::steady_clock::time_point t0, size_t sa) -> int {
         std::vector<float> lg;
+        bool snapped = false;
+        for (size_t i = i_first; i < prompt.size();) {
+            strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
+            strata::core::progress_beat();
+            if (model.fast() && !snapped && i == sa) {
+                if (model.snapshot_save()) {
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) sa);
+                    snap_img_hash = img_hash(snap_tokens.size());
+                    snap_in_slot = false;
+                } else {
+                    snap_tokens.clear();
+                }
+                snapped = true;
+            }
+            size_t chunk = std::min<size_t>(8, prompt.size() - i);
+            if (model.fast() && !snapped && i < sa && i + chunk > sa) chunk = sa - i;
+            std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
+            const bool ok = model.forward(part, lg, err);
+            if (!ok) {
+                snap_tokens.clear();
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                return 1;
+            }
+            i += chunk;
+            if (o.serve) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), i, prompt.size(), ms,
+                            (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
+            }
+            if (read_stopped()) { finish = "cancel"; break; }
+        }
+        return 0;
+    };
+    const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
+                                 std::chrono::steady_clock::time_point& t0) -> int {
+        reuse = prep_restore(prompt);
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
         // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
-        bool snapped = false;
         // the batched prompt path (glm_prefill.cu) reads all but the last prompt token in chunks, layer by layer;
         // the last one goes through the token path, which leaves the logits the first sample reads
         const int pchunk = model.fast() ? model.prefill_chunk() : 0;
@@ -1850,7 +1895,7 @@ static int glm_pack_generate(const Options& o) {
             };
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
-            const std::vector<size_t> marks = read_marks(prompt, reuse, sa, sys_end, div);
+            const std::vector<size_t> marks = read_marks(prompt, reuse, sa, sys_end, restore_div);
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true, between_failed = false;
             // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
@@ -1899,7 +1944,7 @@ static int glm_pack_generate(const Options& o) {
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
-                        else if (end == div)
+                        else if (end == restore_div)
                             slot_prefix(prompt, end, " (where it parts from a kept conversation, for the next one that does)");
                         ++mi;
                         seg_start = end;
@@ -1957,38 +2002,7 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         }
-        for (size_t i = i_first; i < prompt.size();) {
-            strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
-            strata::core::progress_beat();
-            if (model.fast() && !snapped && i == sa) {
-                if (model.snapshot_save()) {
-                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) sa);
-                    snap_img_hash = img_hash(snap_tokens.size());
-                    snap_in_slot = false;
-                } else {
-                    snap_tokens.clear();
-                }
-                snapped = true;
-            }
-            size_t chunk = std::min<size_t>(8, prompt.size() - i);
-            if (model.fast() && !snapped && i < sa && i + chunk > sa) chunk = sa - i;
-            std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
-            const bool ok = model.forward(part, lg, err);
-            if (!ok) {
-                snap_tokens.clear();
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
-                return 1;
-            }
-            i += chunk;
-            if (o.serve) {
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), i, prompt.size(), ms,
-                            (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
-            }
-            if (read_stopped()) { finish = "cancel"; break; }
-        }
-        return 0;
+        return prep_tail(prompt, i_first, reuse, finish, t0, sa);
     };
     // PAUSE: the snapshot moves from the prompt to the last token fed (the decode feeds every written token but
     // the last), so prompt + what was written continues it with one token to read instead of all it wrote.
@@ -2403,6 +2417,9 @@ static int glm_pack_generate(const Options& o) {
         bool ready = false;      // just admitted: the first sample's logits are on the tail
         bool inflight = false, done = false, pause = false, keep = false;
         bool images = false;     // its prompt had pictures
+        bool reading = false;    // its prompt is being read beside the decode (the Reader)
+        size_t sa = 0, sys_end = 0, div = 0;   // its state's place (before the reply's opening) and its shared slots'
+        std::vector<size_t> stops;             // the Reader's segment ends: the marks, then sa
         const char* finish = "length";
         size_t reuse = 0;
         std::chrono::steady_clock::time_point t0, t1;
@@ -2418,6 +2435,35 @@ static int glm_pack_generate(const Options& o) {
     std::vector<std::unique_ptr<Gen>> gens;
     std::deque<Gen*> flight;     // issued, oldest first
     std::deque<int> flight_groups;   // split rows: the sizes of the issued groups, oldest first
+    // THE PROMPT BESIDE THE DECODE: a request admitted while others decode reads its prompt's batched part on a thread
+    // of its own (prefill_begin's background: the prompt's stream, its own copy of the sequence's layout), and the
+    // others go on decoding; its last token and the snapshot follow on this thread (reader_finish).  One at a time:
+    // a request that arrives meanwhile waits in `pending`.  STRATA_GLM_PREFILL_FG=1: the prompt stops the others, as
+    // before (and with --kv-streaming, whose host copies follow the bound sequence)
+    struct Reader {
+        Gen* g = nullptr;
+        std::thread th;
+        std::atomic<bool> done{false};
+        bool ok = false;
+        std::string err;
+        std::vector<int32_t> part;
+        size_t from = 0, to = 0;   // the prompt's tokens [from, to) this read covers
+    };
+    std::unique_ptr<Reader> reader;
+    static const bool prefill_fg = env_num("STRATA_GLM_PREFILL_FG", 0) != 0;
+    // an error or the end: the prompt stops at its next chunk, the tail goes back; its request is left to the caller
+    const auto reader_abort = [&] {
+        if (!reader) return;
+        admit_stop.store(true);
+        reader->th.join();
+        model.prefill_progress = nullptr;
+        std::string fe;
+        model.prefill_finish(fe);
+        admit_stop.store(false);
+        admitting_rid.store(-1);
+        reader->g->reading = false;
+        reader.reset();
+    };
     // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
     // here with what its GEN line said, and is admitted when one frees
     struct Pending {
@@ -2768,6 +2814,7 @@ static int glm_pack_generate(const Options& o) {
     uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: STRATA_GLM_PREFILL_INTERLEAVE)
     std::string multi_fail_why;
     const auto multi_fail = [&](const std::string& why) {
+        reader_abort();
         ++multi_fails;
         multi_fail_why = why;
         std::vector<int> failed;
@@ -2829,8 +2876,148 @@ static int glm_pack_generate(const Options& o) {
     // (prefill_gap_due; STRATA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
     double gap_round_ms = 0.0;
     static const bool gap_credit = env_num("STRATA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
+    // a request whose prompt has been read (it is in gens): its first token, or its end if it was stopped meanwhile
+    const auto gen_admitted = [&](Gen& g) {
+        // a STOP <rid> during its prompt; a bare STOP stays set and also ends the running requests
+        if (admit_stop.exchange(false) || stop_req.load()) g.finish = "cancel";
+        g.t1 = std::chrono::steady_clock::now();
+        g.st1 = model.fast_stats();
+        g.spec_steps0 = model.spec_steps_;
+        g.spec_hits0 = model.spec_hits_;
+        if (gens.size() == 1) {
+            multi_n = 0;
+            multi_t1 = g.t1;
+            multi_st1 = g.st1;
+        }
+        if (std::strcmp(g.finish, "cancel") == 0) {
+            gen_finish(g);
+            gen_sweep();
+            return;
+        }
+        g.ready = true;
+        if (gens.size() > 1 && !resolve_ready()) multi_fail(err);   // the others decode: its first token now
+        if (!deferred_pauses.empty() && gens.size() > 1) flush_pauses();   // (its first token taken: the tail is free)
+        gen_sweep();
+    };
+    // a segment [from, to) of gp's prompt on the Reader (prefill_begin's background); false: not started (err says why)
+    const auto reader_start = [&](Gen* gp, size_t from, size_t to) -> bool {
+        std::vector<int32_t> part(gp->prompt.begin() + (long) from, gp->prompt.begin() + (long) to);
+        if (!model.prefill_begin((int64_t) part.size(), gp->prompt[to], true, err)) return false;
+        reader = std::make_unique<Reader>();
+        Reader* R = reader.get();
+        R->part = std::move(part);
+        R->g = gp;
+        R->from = from;
+        R->to = to;
+        gp->reading = true;
+        const std::string rtag = std::to_string(gp->rid) + " ";
+        const auto rt0 = gp->t0;
+        const size_t rreuse = gp->reuse, rfrom = from, rtotal = gp->prompt.size();
+        model.prefill_progress = [&, rtag, rt0, rreuse, rfrom, rtotal](int64_t done, int64_t total) {
+            (void) total;
+            if (o.serve) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt0).count();
+                std::printf("PP %s%zu %zu %.1f %.1f %zu\n", rtag.c_str(), rfrom + (size_t) done, rtotal, ms,
+                            (double) (rfrom - rreuse + (size_t) done) / (ms / 1000.0 + 1e-9), rreuse);
+                std::fflush(stdout);
+            }
+            return !stop_req.load() && !admit_stop.load();
+        };
+        R->th = std::thread([&model, R] {
+            R->ok = model.prefill_run(R->part, R->err);
+            R->done.store(true, std::memory_order_release);
+        });
+        return true;
+    };
+    // the Reader is done: the decode drains (the token path and the snapshot use the shared streams and buffers), the
+    // tail goes back; at a mark its shared slot and the next segment, else the prompt's last token and the request's first
+    const auto reader_finish = [&] {
+        Reader* R = reader.get();
+        R->th.join();
+        model.prefill_progress = nullptr;
+        Gen& g = *R->g;
+        const bool drained = multi_drain();
+        std::string fe;
+        const bool fok = model.prefill_finish(fe);
+        admitting_rid.store(-1);
+        std::string e = !R->ok ? R->err : !fok ? fe : std::string();
+        const size_t r_to = R->to;
+        g.reading = false;
+        reader.reset();
+        if (!drained) {
+            multi_fail(err);
+            return;
+        }
+        bind_ctx(g.ctx);
+        tag = std::to_string(g.rid) + " ";
+        int rc = 0;
+        if (e == "cancelled") {   // (it keeps what it read: every part stopped at the same chunk boundary)
+            const int64_t kept = model.position();
+            if (model.fast() && kept > (int64_t) g.reuse && kept < (int64_t) g.prompt.size() && model.snapshot_save()) {
+                snap_tokens.assign(g.prompt.begin(), g.prompt.begin() + kept);
+                snap_img_hash = img_hash(snap_tokens.size());
+                snap_in_slot = false;
+                std::fprintf(stderr, "glm slots: a cancelled prompt keeps the %lld tokens it read (%zu new)\n",
+                             (long long) kept, (size_t) kept - g.reuse);
+            } else if (!(kept == (int64_t) g.reuse && g.reuse > 0)) {
+                snap_tokens.clear();
+                model.reset();
+            }
+            g.finish = "cancel";
+            std::fprintf(stderr, "glm multi: request %d's prompt cancelled while it was read\n", g.rid);
+        } else if (!e.empty()) {
+            snap_tokens.clear();
+            drop_if_poisoned(g.prompt, e);
+            model.reset();
+            std::printf("ERR %s%s\n", tag.c_str(), e.c_str());
+            rc = 1;
+        } else {
+            size_t from = r_to;   // the token path's start, if the read goes no further on the Reader
+            if (r_to < g.sa) {    // a mark: its shared slot, then the next segment on the Reader
+                if (r_to == g.sys_end) slot_prefix(g.prompt, r_to);
+                else if (r_to == g.div)
+                    slot_prefix(g.prompt, r_to, " (where it parts from a kept conversation, for the next one that does)");
+                size_t next = g.sa;
+                for (const size_t st : g.stops)
+                    if (st > r_to) { next = st; break; }
+                admitting_rid.store(g.rid);
+                if (reader_start(&g, r_to, next)) {
+                    tag.clear();
+                    return;
+                }
+                admitting_rid.store(-1);
+                if (!err.empty()) {
+                    snap_tokens.clear();
+                    std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                    rc = 1;
+                }
+            } else {
+                from = g.sa;
+                if (o.serve) {
+                    const double ms =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g.t0).count();
+                    std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), g.sa, g.prompt.size(), ms,
+                                (double) (g.sa - g.reuse) / (ms / 1000.0 + 1e-9), g.reuse);
+                }
+            }
+            if (rc == 0) rc = prep_tail(g.prompt, from, g.reuse, g.finish, g.t0, g.sa);
+        }
+        tag.clear();
+        if (rc != 0) {
+            ctxs[(size_t) g.ctx].busy = false;
+            g.done = true;
+            gen_sweep();
+            return;
+        }
+        gen_admitted(g);
+    };
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
+        if (reader) {   // one prompt read at a time: this one waits for it
+            pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
+                               req_bias});
+            return;
+        }
         if (!multi_drain() || !resolve_ready()) {
             const std::string why = err;
             multi_fail(why);
@@ -2962,7 +3149,37 @@ static int glm_pack_generate(const Options& o) {
         }
         admit_stop.store(false);
         admitting_rid.store(rid);
-        const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
+        int rc = 0;
+        // (upstream's in-thread modes, STRATA_GLM_PREFILL_GAPS / _INTERLEAVE, read it themselves when set)
+        if (!gens.empty() && model.fast() && !prefill_fg && !use_gaps && !prompt_piece && model.prefill_beside_ok()) {
+            // others are decoding: the batched part on the Reader, they go on meanwhile - in segments ending at the
+            // marks (the system prompt's end, a divergence point: their shared slots), then before the reply's opening
+            g->reuse = prep_restore(g->prompt);
+            g->t0 = std::chrono::steady_clock::now();
+            g->sa = snap_pos(g->prompt, req_gt);
+            g->div = restore_div;
+            g->sys_end = strata::core::system_prompt_end(g->prompt.data(), g->prompt.size(), 154827);   // <|user|>
+            g->stops = read_marks(g->prompt, g->reuse, g->sa, g->sys_end, g->div);
+            g->stops.push_back(g->sa);
+            if (model.prefill_chunk() > 0 && g->sa > g->reuse) {
+                if (reader_start(g.get(), g->reuse, g->stops.front())) {
+                    tag.clear();
+                    const size_t n_read = g->sa - g->reuse;
+                    gens.push_back(std::move(g));
+                    std::fprintf(stderr, "glm multi: request %d reads %zu prompt tokens beside %zu decoding\n", rid,
+                                 n_read, gens.size() - 1);
+                    return;
+                }
+                if (!err.empty()) {
+                    snap_tokens.clear();
+                    std::printf("ERR %s%s\n", tag.c_str(), err.c_str());
+                    rc = 1;
+                }
+            }
+            if (rc == 0) rc = prep_tail(g->prompt, g->reuse, g->reuse, g->finish, g->t0, g->sa);
+        } else {
+            rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
+        }
         admitting_rid.store(-1);
         prompt_piece = nullptr;
         prompt_between = nullptr;
@@ -2982,31 +3199,12 @@ static int glm_pack_generate(const Options& o) {
             ctl.erase(rid);
             return;
         }
-        // a STOP <rid> during its prompt (admit_stop); a bare STOP stays set and also ends the running requests
-        if (admit_stop.exchange(false) || stop_req.load()) g->finish = "cancel";
-        g->t1 = std::chrono::steady_clock::now();
-        g->st1 = model.fast_stats();
-        g->spec_steps0 = model.spec_steps_;
-        g->spec_hits0 = model.spec_hits_;
-        if (gens.empty()) {
-            multi_n = 0;
-            multi_t1 = g->t1;
-            multi_st1 = g->st1;
-        }
-        if (std::strcmp(g->finish, "cancel") == 0) {
-            gens.push_back(std::move(g));
-            gen_finish(*gens.back());
-            gen_sweep();
-            return;
-        }
-        g->ready = true;
         gens.push_back(std::move(g));
-        if (gens.size() > 1 && !resolve_ready()) multi_fail(err);   // the others decode: its first token now
-        if (!deferred_pauses.empty() && gens.size() > 1) flush_pauses();   // (its first token taken: the tail is free)
-        gen_sweep();
+        gen_admitted(*gens.back());
     };
     // the waiting requests, in order, that an idle context can now hold (a STOP for one ends it unread)
     const auto admit_pending = [&] {
+        if (reader) return;
         for (size_t i = 0; i < pending.size();) {
             const Pending& w = pending[i];
             bool stopped = false;
@@ -3051,8 +3249,12 @@ static int glm_pack_generate(const Options& o) {
         if (!deferred_pauses.empty() && !in_read_gap && admitting_rid.load() < 0 &&
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
+        if (reader && reader->done.load(std::memory_order_acquire)) {
+            reader_finish();
+            return;
+        }
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
-        if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready()) {
+        if (only != nullptr && !only->inflight && !only->reading && multi_spec && !step_no_spec && model.spec_ready()) {
             Gen& g = *only;
             bind_ctx(g.ctx);
             if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
@@ -3247,7 +3449,11 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             if (!issue()) { multi_fail(err); return; }
-            if (flight.empty()) { gen_sweep(); return; }
+            if (flight.empty()) {
+                if (reader) std::this_thread::sleep_for(std::chrono::milliseconds(2));   // only the prompt runs
+                gen_sweep();
+                return;
+            }
             const int k = flight_groups.front();   // the oldest group, all of it
             flight_groups.pop_front();
             for (int j = 0; j < k; ++j) {
@@ -3280,6 +3486,7 @@ static int glm_pack_generate(const Options& o) {
             flight.push_back(&g);
         }
         if (flight.empty()) {
+            if (reader) std::this_thread::sleep_for(std::chrono::milliseconds(2));   // only the prompt runs
             gen_sweep();
             return;
         }
@@ -4288,6 +4495,7 @@ static int glm_pack_generate(const Options& o) {
         if (cmd.empty()) continue;
         std::printf("ERR unsupported command '%s' (GEN, GENI, LOGP, VLEND, VRECLAIM, STOP and QUIT)\n", cmd.c_str());
     }
+    reader_abort();
     // the engine ends (QUIT, or the server gone): the conversation in the model is kept for the next start
     if (multi) {   // the requests still running end here (their DONE lines), then every context's conversation
         for (const Pending& w : pending) std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", w.rid, w.ids.size());
