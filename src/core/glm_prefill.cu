@@ -4900,6 +4900,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     if (cancelled) {   // (the parts' streams first: the prefix the caller may keep must be complete on every card)
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             cudaSetDevice(m->dev_);
+            if (m->pf_ != nullptr && m->pf_->cs != nullptr) cudaStreamSynchronize(m->pf_->cs);   // (the prompt's own stream)
             cudaStreamSynchronize(m->fast_->cs);
             cudaStreamSynchronize(m->fast_->copy);
         }
