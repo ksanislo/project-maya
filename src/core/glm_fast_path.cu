@@ -7050,6 +7050,10 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     return (uint64_t) f.tellp();
 }
 
+// A slot back into the model, whatever split wrote it: the file holds, per part that wrote it, its layer range and
+// that range's state in layer order (the KDA snapshot, the open index pools, the DSA caches), so every layer's data
+// goes to the part that runs that layer now - a start that splits the layers differently (they follow the free VRAM)
+// still takes back the conversations kept before it.
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
     ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
@@ -7062,79 +7066,124 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
     uint64_t magic = 0;
     uint32_t nh = 0;
     int64_t n = 0;
-    std::vector<Glm5Model*> halves;
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) halves.push_back(m);
-    if (!get(&magic, 8) || !get(&nh, 4) || !get(&n, 8) || magic != kSlotMagic || nh != halves.size() || n != n_pos ||
+    std::vector<Glm5Model*> parts;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) parts.push_back(m);
+    if (!get(&magic, 8) || !get(&nh, 4) || !get(&n, 8) || magic != kSlotMagic || nh == 0 || nh > 64 || n != n_pos ||
         n <= 0 || n > max_ctx_) {
         err = "not a slot of this model";
         return false;
     }
-    std::vector<float> buf;
-    for (Glm5Model* m : halves) {
+    const Glm5Geometry& g = g_;
+    const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
+    const int64_t rows2 = (int64_t) 2 * (g.idx_kpool - 1) * g.idx_key;   // a DSA layer's open pool: ik, ig rows
+    // every part ready: idle, its snapshot buffers there
+    for (Glm5Model* m : parts) {
         if (m->fast_ == nullptr) {
             err = "no fast path";
             return false;
         }
-        const Glm5Geometry& g = m->g_;
-        const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
-        int32_t n_rec = 0;
+        int n_rec = 0;
         for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
-        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
-                                        m->kv_ != nullptr ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
-                                        m->dsa_ig_, m->dsa_pool_, n);
-        int32_t hdr[4] = {};
-        int64_t frun = 0;
-        if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||
-            hdr[3] != (int32_t) runs.size() || frun != run) {
-            err = "the slot's layout differs from this model's";
-            return false;
-        }
-        for (const auto& r : runs) {
-            int64_t fl = 0;
-            if (!get(&fl, 8) || fl != r.second) {
-                err = "the slot's layout differs from this model's";
-                return false;
-            }
-        }
+        const size_t n_dsa = m->dsa_layers().size();
         cudaSetDevice(m->dev_);
         cudaStreamSynchronize(m->fast_->cs);
-        if (m->snap_ == nullptr && n_rec > 0 &&
-            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+        if ((n_rec > 0 && m->snap_ == nullptr && cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) ||
+            (n_dsa > 0 && m->snap_pool_ == nullptr &&
+             cudaMalloc(&m->snap_pool_, n_dsa * (size_t) rows2 * sizeof(float)) != cudaSuccess)) {
             cudaGetLastError();
-            m->snap_ = nullptr;
             cudaSetDevice(dev_);
             err = "the snapshot did not allocate";
             return false;
         }
-        std::vector<std::pair<float*, int64_t>> dst;
-        if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
-        const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
-        if (pool_rows > 0) {
-            if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
+    }
+    // the part that runs layer il now (the NextN block: the one that carries it), and il's place among its KDA layers
+    // and its DSA layers
+    const auto owner = [&](int il) -> Glm5Model* {
+        for (Glm5Model* m : parts)
+            if (il == m->mtp_il_ || (il < g.n_layers && il >= m->l0_ && il < m->l1_)) return m;
+        return nullptr;
+    };
+    const auto kda_index = [&](Glm5Model* m, int il) {
+        int k = 0;
+        for (int j = m->l0_; j < il; ++j) k += g.is_recr(j);
+        return k;
+    };
+    const auto dsa_index = [&](Glm5Model* m, int il) {
+        const std::vector<int> ls = m->dsa_layers();
+        return (int) (std::find(ls.begin(), ls.end(), il) - ls.begin());
+    };
+    std::vector<float> buf;
+    const auto copy_in = [&](Glm5Model* m, float* dst, int64_t floats) -> bool {
+        cudaSetDevice(m->dev_);
+        constexpr int64_t kChunk = (int64_t) 16 << 20;
+        for (int64_t at = 0; at < floats; at += kChunk) {
+            const int64_t c = std::min(kChunk, floats - at);
+            buf.resize((size_t) c);
+            // (Default: a KV-streamed layer's latents are its pinned host copy)
+            if (!get(buf.data(), (size_t) c * sizeof(float)) ||
+                cudaMemcpy(dst + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyDefault) != cudaSuccess) {
                 cudaGetLastError();
-                m->snap_pool_ = nullptr;
-                cudaSetDevice(dev_);
-                err = "the snapshot did not allocate";
                 return false;
             }
-            dst.push_back({m->snap_pool_, pool_rows});
         }
-        for (const auto& r : runs) dst.push_back({r.first, r.second});
-        for (const auto& d : dst) {
-            constexpr int64_t kChunk = (int64_t) 16 << 20;
-            for (int64_t at = 0; at < d.second; at += kChunk) {
-                const int64_t c = std::min(kChunk, d.second - at);
-                buf.resize((size_t) c);
-                if (!get(buf.data(), (size_t) c * sizeof(float)) ||
-                    cudaMemcpy(d.first + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyDefault) !=
-                        cudaSuccess) {
-                    cudaGetLastError();
-                    cudaSetDevice(dev_);
-                    err = "the slot did not read back";
-                    return false;
-                }
-            }
+        return true;
+    };
+    int kda_seen = 0, dsa_seen = 0, kda_want = 0, dsa_want = 0;
+    for (Glm5Model* m : parts) {
+        for (int il = m->l0_; il < m->l1_; ++il) (g.is_recr(il) ? kda_want : dsa_want) += 1;
+        dsa_want += m->mtp_il_ >= 0;
+    }
+    const auto differs = [&]() {
+        cudaSetDevice(dev_);
+        err = "the slot's layout differs from this model's";
+        return false;
+    };
+    for (uint32_t h = 0; h < nh; ++h) {
+        int32_t hdr[4] = {};
+        int64_t frun = 0;
+        if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || frun != run || hdr[0] < 0 || hdr[1] > g.n_layers ||
+            hdr[0] >= hdr[1] || hdr[3] < 0 || hdr[3] > 2 * (g.n_layers + 1))
+            return differs();
+        std::vector<int> kls, dls;
+        for (int il = hdr[0]; il < hdr[1]; ++il) (g.is_recr(il) ? kls : dls).push_back(il);
+        if ((int) kls.size() != hdr[2]) return differs();
+        // the part that wrote this had the NextN block when it has one DSA layer's two runs more than its range
+        const int extra = hdr[3] / 2 - (int) dls.size();
+        if (hdr[3] % 2 != 0 || extra < 0 || extra > 1) return differs();
+        if (extra == 1) {
+            int mtp = -1;
+            for (Glm5Model* m : parts) mtp = std::max(mtp, m->mtp_il_);
+            if (mtp < 0) return differs();
+            dls.insert(dls.begin(), mtp);
         }
+        std::vector<int64_t> lens((size_t) hdr[3]);
+        for (auto& l : lens)
+            if (!get(&l, 8)) return differs();
+        for (const int il : kls) {
+            Glm5Model* m = owner(il);
+            if (m == nullptr || !copy_in(m, m->snap_ + (int64_t) kda_index(m, il) * run, run)) return differs();
+            ++kda_seen;
+        }
+        for (const int il : dls) {
+            Glm5Model* m = owner(il);
+            if (m == nullptr || !copy_in(m, m->snap_pool_ + (int64_t) dsa_index(m, il) * rows2, rows2)) return differs();
+        }
+        for (size_t i = 0; i < dls.size(); ++i) {
+            const int il = dls[i];
+            Glm5Model* m = owner(il);
+            const int64_t lat_pp = m->lat_q8_ ? (int64_t) gf::lat8_rec_bytes(g.kv_lora) / 4
+                                   : m->fast_mode_ ? g.kv_lora / 2 : g.kv_lora;
+            const int64_t lat_n = n * lat_pp, pool_n = (n + g.idx_kpool - 1) / g.idx_kpool * g.idx_key;
+            float* lat = m->kv_ != nullptr && m->kv_->host[(size_t) il] != nullptr ? (float*) m->kv_->host[(size_t) il]
+                                                                                   : m->state_ + m->dsa_lat_[(size_t) il];
+            if (lens[2 * i] != lat_n || lens[2 * i + 1] != pool_n || !copy_in(m, lat, lat_n) ||
+                !copy_in(m, m->state_ + m->dsa_pool_[(size_t) il], pool_n))
+                return differs();
+            ++dsa_seen;
+        }
+    }
+    if (kda_seen != kda_want || dsa_seen != dsa_want) return differs();
+    for (Glm5Model* m : parts) {
         m->kv_stream_reset_maps();   // KV streaming: the slots held the other conversation's blocks
         m->snap_pos_ = n;
     }
