@@ -4739,6 +4739,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // gaps: the chunks each part has read and the boundaries released (strata/core/prefill_gaps.hpp)
         strata::core::PipelineGaps G(np, nc);
         bool stop = false;
+        // a cancel stops the FIRST part before its next chunk and the later ones finish what it produced: every part
+        // ends at the same chunk boundary, a state the caller can keep (limit: the chunks that run)
+        int limit = nc;
+        std::atomic<bool> want_stop{false};
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
         const auto fail = [&](std::string e) {
@@ -4778,8 +4782,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 for (int c = 0; c < nc; ++c) {
                     {
                         std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return (produced[(size_t) k - 1] > c && (!gaps || G.may_start(k, c))) || stop; });
-                        if (stop) return;
+                        cv.wait(lk, [&] {
+                            return (produced[(size_t) k - 1] > c && (!gaps || G.may_start(k, c))) || stop || c >= limit;
+                        });
+                        if (stop || (c >= limit && produced[(size_t) k - 1] <= c)) return;
                     }
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -4826,10 +4832,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         return;
                     }
                     if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
-                        fail("cancelled");
-                        return;
-                    }
+                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n))
+                        want_stop.store(true);
                     read_done();
                 }
             });
@@ -4838,6 +4842,13 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             {
                 std::lock_guard<std::mutex> lk(mu);
                 if (stop) break;
+                if (want_stop.load()) {
+                    limit = c;
+                    cancelled = true;
+                    G.released = nc;   // (gaps: the later parts finish the chunks before the limit without waiting)
+                    cv.notify_all();
+                    break;
+                }
             }
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -4861,7 +4872,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         if (stop) break;
                     }
                     std::string e0;
-                    if (run_gap(e0) != 0) {
+                    const int r = run_gap(e0);
+                    if (r == 1) want_stop.store(true);   // (a cancel in the gap keeps what was read, as at a chunk)
+                    else if (r != 0) {
                         fail(e0);
                         break;
                     }
@@ -4882,9 +4895,15 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 return false;
             }
         }
-        for (Glm5Model* m : parts) m->pf_->v.pos = pos_start + n;
+        for (Glm5Model* m : parts) m->pf_->v.pos = pos_start + std::min<int64_t>(n, (int64_t) limit * Tc);
     }
-    if (cancelled) {
+    if (cancelled) {   // (the parts' streams first: the prefix the caller may keep must be complete on every card)
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            cudaStreamSynchronize(m->fast_->cs);
+            cudaStreamSynchronize(m->fast_->copy);
+        }
+        cudaSetDevice(dev_);
         err = "cancelled";
         return false;
     }
