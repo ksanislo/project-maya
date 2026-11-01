@@ -3,7 +3,8 @@
 // (iq_cpu_rows, iq_cpu_gate_up): random blocks at the experts' widths and others, 1 to 16 tokens a call, whole
 // matrices and row ranges that start mid-way (the rows outside untouched), block scales at their edges (zero, -0,
 // subnormal, the largest F16) and activations scaled down until the sums are subnormal (IQ1_M's last FMA).  One
-// thread, no GPU.
+// thread, no GPU.  On a CPU with AVX but no AVX2 it checks the AVX1 rows' types instead (ds4_iq128_kern.inc), which
+// the lane must take there.
 //
 //   DS4_IQ512=1 ds4_iq512_rows_test       the rows forced on: on a CPU with AVX-512 F / BW / VL / DQ and BMI2 the
 //                                         lane must take them for all three types
@@ -35,7 +36,11 @@ namespace gg = strata::ds4::gguf;
 
 namespace {
 
-const int kTypes[] = {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_M};
+const int kTypes512[] = {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_M};
+// (a CPU with AVX but no AVX2: the AVX1 rows' types, ds4_iq128_kern.inc, which the lane must take)
+const int kTypesAvx1[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S};
+bool cpu_avx1_only();
+std::vector<int> kTypes;
 
 void put_scale(int type, uint8_t* blk, uint16_t d) {   // (IQ1_M: the F16 in the top nibbles of its 4 scale words)
     if (type != GGML_TYPE_IQ1_M) {
@@ -202,10 +207,22 @@ bool cpu_x512() {
 #endif
 }
 
+bool cpu_avx1_only() {
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx") && !(__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"));
+#else
+    return false;
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     ggml_cpu_init();
+    const bool avx1 = cpu_avx1_only();
+    if (avx1) kTypes.assign(std::begin(kTypesAvx1), std::end(kTypesAvx1));
+    else kTypes.assign(std::begin(kTypes512), std::end(kTypes512));
     const char* e = std::getenv("DS4_IQ512");
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         std::printf("ds4_iq512_rows_test --bench: DS4_IQ512=%s DS4_IQ_OWN=%s, one thread\n", e != nullptr ? e : "(unset)",
@@ -227,6 +244,12 @@ int main(int argc, char** argv) {
                 cpu_x512() ? "yes" : "no");
     for (int type : kTypes) std::printf(" %s %s", ggml_type_name((ggml_type) type), gg::iq_cpu_own_rows(type) ? "on" : "off");
     std::printf("\n");
+    if (avx1 && std::getenv("DS4_IQ_OWN") == nullptr)
+        for (int type : kTypes)
+            if (!gg::iq_cpu_own_rows(type)) {
+                std::printf("FAIL: an AVX-only CPU but the lane does not take the %s AVX1 rows\n", ggml_type_name((ggml_type) type));
+                return 1;
+            }
     if (forced && cpu_x512())
         for (int type : kTypes)
             if (!gg::iq_cpu_own_rows(type)) {
