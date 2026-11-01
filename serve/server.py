@@ -1270,6 +1270,8 @@ class StrataEngine:
             return
         self.progress = None
         self.prefill_tok_s_mean = None
+        if getattr(self, "_tls", None) is not None:   # (this request's own prompt progress: Service._progress)
+            self._tls.own_pp = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1331,6 +1333,8 @@ class StrataEngine:
                                          int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
                                          float(f[3]) if len(f) >= 4 else 0.0)
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        if getattr(self, "_tls", None) is not None:
+                            self._tls.own_pp = (self.progress, self.prefill_tok_s_mean)
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -1461,6 +1465,7 @@ class StrataEngine:
         self._tls.rid = rid
         self.progress = None
         self.prefill_tok_s_mean = None
+        self._tls.own_pp = None
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
@@ -1533,6 +1538,8 @@ class StrataEngine:
                                          int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
                                          float(f[4]) if len(f) >= 5 else 0.0)
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
+                        if getattr(self, "_tls", None) is not None:
+                            self._tls.own_pp = (self.progress, self.prefill_tok_s_mean)
                     if cancel.is_set():
                         return
                     yield None
@@ -2036,6 +2043,19 @@ class RequestStat:
         self.spec_off = False                           # it asked for no drafting (spec=1)
         self.base = None                                # (time, generated) at the window's start: the rate counts from it
         self.samples = collections.deque(maxlen=4096)   # the samples inside the window, oldest first
+        # what the Monitor shows of this request (several answer at once: each its own, not the shared status's)
+        self.phase, self.generated, self.prompt_tokens, self.max_tokens = "waiting", 0, 0, None
+        self.started, self.progress, self.prefill_tok_s = None, None, None
+
+    def view(self, now) -> dict:
+        """One row of the Monitor's Conversations: reading (with its own progress), writing or between its turns."""
+        pr = self.progress
+        return {"state": "writing" if self.first_token else "reading" if self.started else "waiting",
+                "phase": self.phase, "prompt_tokens": self.prompt_tokens, "generated": self.generated,
+                "max_tokens": self.max_tokens, "prompt_read": pr[0] if pr else None, "prompt_total": pr[1] if pr else None,
+                "prefill_tok_s": self.prefill_tok_s if not self.first_token else None,
+                "tok_s": round(self.tok_s(now), 1) if self.first_token else None,
+                "elapsed_s": round(now - self.started, 1) if self.started else None}
 
     def clear(self):
         self.base = None
@@ -2088,6 +2108,8 @@ class Service:
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
         self.current_requests: set[RequestStat] = set()  # the requests decoding now: first token to the end of run()
         self.latest_request: RequestStat | None = None  # the request that last got the engine
+        self.running: set[RequestStat] = set()          # every request with the engine now, reading or writing
+        self.ended = collections.deque(maxlen=6)        # the last few that ended (the Monitor's Conversations)
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -2791,7 +2813,9 @@ class Service:
             active = self.active
             writing = len(self.current_requests)        # (of the active ones, those past their prompt)
             spec_off = bool(self.current_requests) and all(r.spec_off for r in self.current_requests)
-        now = time.time()
+            now = time.time()
+            convs = sorted((r.view(now) for r in self.running), key=lambda v: -(v["elapsed_s"] or 0))
+            ended = list(self.ended)
         progress = getattr(self.engine, "progress", None)
         if s.get("busy") and not answering:
             state = "reading"
@@ -2812,6 +2836,13 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
+        # several at once: each request's own figures (Conversations), and the counts summed over them
+        live["conversations"], live["ended"] = convs, ended
+        if len(convs) > 1:
+            live["generated"] = sum(v["generated"] for v in convs)
+            reading = [v for v in convs if v["state"] == "reading" and v["prompt_total"]]
+            if reading:
+                live["prompt_read"], live["prompt_total"] = reading[-1]["prompt_read"], reading[-1]["prompt_total"]
         # the prompt the conversation cache already held (the Monitor's Context bar), from the engine's PP lines
         live["prompt_reused"] = progress[2] if s.get("busy") and progress and len(progress) > 2 else None
         engine = {"model": self.model, "model_label": self.model_label, "max_context": self.engine.max_context,
@@ -3197,6 +3228,7 @@ class Service:
                 stat.first_token = now
                 self.current_requests.add(stat)
             stat.note(now, n)                           # this request's window over the last RATE_WINDOW_S
+            stat.generated = n
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -3206,24 +3238,33 @@ class Service:
                     s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
+                else:
+                    continue
+                stat.phase = s["phase"]
+            for ev in evs:
                 s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
+            if stat.phase == "reading the prompt":
+                stat.phase = "writing"
 
-    def _progress(self, last_print, every=1.0):
-        """A progress line in the server window every `every` seconds while a request runs."""
+    def _progress(self, last_print, stat, every=1.0):
+        """A progress line in the server window every `every` seconds while a request runs - its own figures (with
+        several at once the shared status mixed one request's count with another's clock)."""
         now = time.time()
-        if now - last_print < every:
-            return last_print
+        pp = getattr(getattr(self.engine, "_tls", None), "own_pp", None)   # (this thread's prompt progress, its rate)
         with self.status_lock:
-            s = dict(self.status)
-            r = self.latest_request if self.latest_request in self.current_requests else None
-        el = now - s.get("started", now)
-        if r is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            if pp and stat.first_token is None:
+                stat.progress, stat.prefill_tok_s = pp
+            if now - last_print < every:
+                return last_print
+            r = stat.view(now)
+        el = r["elapsed_s"] or 0
+        if stat.first_token is None:
+            pr = stat.progress or getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{r['prompt_tokens']:,}"   # prefix counts as read (#29)
             print(f"[maya] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
-            rate = s["generated"] / max(1e-6, now - r.first_token)
-            print(f"[maya] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            rate = r["generated"] / max(1e-6, now - stat.first_token)
+            print(f"[maya] {r['phase']}: {r['generated']} of max {r['max_tokens']} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -3673,6 +3714,9 @@ class Service:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), tool=None, tail="", max_tokens=max_new)
                     self.latest_request = stat
+                    stat.phase, stat.prompt_tokens, stat.max_tokens = "reading the prompt", len(ids), max_new
+                    stat.started = self.status["started"]
+                    self.running.add(stat)
                     self.active += 1
                     self.touch_telemetry()
                     counted = hold[1] = True
@@ -3782,7 +3826,7 @@ class Service:
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
+                            last_print = self._progress(last_print, stat)
                             pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
@@ -3913,7 +3957,7 @@ class Service:
                                       else parser.feed(text), was)
                         self._say_malformed(parser)
                         self._note(n, evs, stat)
-                        last_print = self._progress(last_print)
+                        last_print = self._progress(last_print, stat)
                         for ev in evs:
                             if ev.kind == "content":
                                 said.append(ev.text)
@@ -3977,6 +4021,9 @@ class Service:
             book = None                                 # (the savings' count: after the lock, it writes a file)
             with self.status_lock:
                 self.current_requests.discard(stat)
+                if stat in self.running:
+                    self.running.discard(stat)
+                    self.ended.appendleft({**stat.view(time.time()), "finish": finish, "time": time.time()})
                 if counted:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
                     last = dict(getattr(self.engine, "last", {}) or {}) \

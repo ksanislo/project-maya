@@ -1150,6 +1150,25 @@ class LiveRateBursts(unittest.TestCase):
         self.assertEqual(self.read_at(svc, 1001.0), 0.0)
 
 
+class ConversationView(unittest.TestCase):
+    """Each request's own Monitor row (RequestStat.view): waiting, reading with its own progress, writing."""
+
+    def test_states_and_own_figures(self):
+        import serve.server as srv
+        r = srv.RequestStat()
+        self.assertEqual(r.view(100.0)["state"], "waiting")
+        r.started, r.prompt_tokens, r.progress, r.prefill_tok_s = 90.0, 5000, (2048, 5000, 0, 1.0), 400.0
+        v = r.view(100.0)
+        self.assertEqual((v["state"], v["prompt_read"], v["prompt_total"], v["prefill_tok_s"], v["elapsed_s"]),
+                         ("reading", 2048, 5000, 400.0, 10.0))
+        r.first_token, r.generated = 101.0, 30
+        r.note(101.0, 0)
+        r.note(103.0, 30)
+        v = r.view(103.0)
+        self.assertEqual((v["state"], v["generated"], v["prefill_tok_s"]), ("writing", 30, None))
+        self.assertGreater(v["tok_s"], 0)
+
+
 class LiveRate(unittest.TestCase):
     """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
 
