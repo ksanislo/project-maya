@@ -1732,9 +1732,17 @@ static int glm_pack_generate(const Options& o) {
     // above) and, with the disk slots on (several conversations too), the system prompt's end (sys_end) and where the
     // prompt parts from a kept conversation (div: an agent's sessions share their instructions past the system
     // prompt) - each kept as a shared slot (slot_prefix) for the next conversation that starts there
+    // STRATA_GLM_SHARED_SLOTS=0: as v1.1.48 - the system prompt's slot only without checkpoints, no divergence slots, no gt=
+    static const bool shared_on = env_num("STRATA_GLM_SHARED_SLOTS", 1) != 0;
     const auto read_marks = [&](const std::vector<int32_t>& prompt, size_t from, size_t end, size_t sys_end, size_t div) {
         std::vector<size_t> at = ckpt_marks(prompt, from, end);
         static const bool prefix_cut_on = env_num("STRATA_GLM_PREFIX_CUT", 1) != 0;   // (#387's switch: 0 = no system-prompt cut)
+        if (!shared_on) {
+            if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
+                strata::core::add_mark(at, strata::core::prefix_cut(prompt.data(), prompt.size(), from, slot_min, 154827),
+                                       from);
+            return at;
+        }
         const size_t sys_cut = prefix_cut_on ? sys_end : 0;
         if (slot_max > 0 && cur_img_pos.empty())
             for (const size_t p : {sys_cut, div})
@@ -1827,7 +1835,7 @@ static int glm_pack_generate(const Options& o) {
         for (const auto& sl : slots) lcp_with(sl.tokens);
         lcp_with(snap_tokens);
         if (each_ctx_snap) each_ctx_snap(lcp_with);
-        const size_t div = lcp < lcp_of ? lcp : 0;   // where it parts from one that goes on differently
+        const size_t div = shared_on && lcp < lcp_of ? lcp : 0;   // where it parts from one that goes on differently
         const bool snap_ok = model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
                              img_hash(snap_tokens.size()) == snap_img_hash && getenv("STRATA_GLM_NO_REUSE") == nullptr;
@@ -1918,8 +1926,9 @@ static int glm_pack_generate(const Options& o) {
         // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
         // from a read with the snapshot before the last token (the default).
         // The server's gt=<n> (the reply's opening, the template's own count) wins over the scan below.
-        size_t snap_at = req_gt > 0 ? snap_pos(prompt, req_gt) : prompt.size() - 1;
-        if (req_gt <= 0) {
+        const int64_t gt = shared_on ? req_gt : 0;
+        size_t snap_at = gt > 0 ? snap_pos(prompt, gt) : prompt.size() - 1;
+        if (gt <= 0) {
             static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
             constexpr int32_t kAsstTok = 154828;   // <|assistant|>
             // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
