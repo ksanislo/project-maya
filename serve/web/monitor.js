@@ -531,6 +531,30 @@ function Requests({m}) {
   </section>`;
 }
 
+// ------------------------------------------------------------------ the conversations: each answer with the engine now
+// (several at once: --parallel), its own phase, prompt read and count, then the last few that ended
+function Conversations({m}) {
+  const live = m.live || {}, convs = live.conversations || [], ended = live.ended || [];
+  if (!convs.length && !ended.length) return null;
+  const row = (c, done) => {
+    const [tone, text] = done ? FINISH[c.finish] || ["muted", c.finish || "–"]
+      : c.state === "reading" ? ["info", "Reading"] : c.state === "writing" ? ["accent", c.phase ? c.phase[0].toUpperCase() + c.phase.slice(1) : "Writing"] : ["muted", "Waiting"];
+    const read = c.prompt_total ? `${fmt(c.prompt_read)} / ${fmt(c.prompt_total)}` : fmt(c.prompt_tokens);
+    const speed = c.state === "reading" && !done ? (c.prefill_tok_s != null ? `${fmt(c.prefill_tok_s)} prefill` : "–") : c.tok_s != null ? fmt(c.tok_s, 1) : "–";
+    return html`<tr class=${done ? "muted" : ""}><td class="l nowrap"><span class=${`badge badge--${tone}`}>${text}</span></td>
+      <td>${read}</td><td>${fmt(c.generated)}${c.max_tokens && !done ? html`<span class="muted small"> / ${fmt(c.max_tokens)}</span>` : null}</td>
+      <td class="strong">${speed}</td><td>${c.elapsed_s == null ? "–" : `${fmt(c.elapsed_s, 1)} s`}</td></tr>`;
+  };
+  return html`<section class="card" aria-label="Conversations">
+    <div class="card__head"><span class="card__title">Conversations</span>
+      <span class="card__sub">${convs.length ? `${convs.length} with the engine now` : "none running"}</span></div>
+    <div class="table-wrap"><table class="table num">
+      <thead><tr><th class="l">Now</th><th>Prompt</th><th>Output</th><th title="Answer tokens per second (prompt tokens while it reads)">Speed</th><th>Time</th></tr></thead>
+      <tbody>${convs.map((c) => row(c, false))}${ended.slice(0, Math.max(0, 6 - convs.length)).map((c) => row(c, true))}</tbody>
+    </table></div>
+  </section>`;
+}
+
 // ------------------------------------------------------------------ the page
 export function MonitorPage() {
   const m = S.metrics;
@@ -560,6 +584,7 @@ export function MonitorPage() {
       ${m ? html`
         <${Banners} m=${m}/>
         <div class="mon__top"><${Throughput} m=${m}/><${RightNow} m=${m}/></div>
+        <${Conversations} m=${m}/>
         <${ContextCard} m=${m}/>
         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
         <${GpuMap} m=${m}/>
