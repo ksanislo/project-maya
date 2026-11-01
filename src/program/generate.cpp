@@ -1770,6 +1770,7 @@ static int glm_pack_generate(const Options& o) {
         int ctx = 0;
         std::vector<int32_t> prompt, emitted;
         bool keep = false;
+        bool text = true;   // the request had no pictures
     };
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
@@ -2086,10 +2087,11 @@ static int glm_pack_generate(const Options& o) {
     };
     // PAUSE: the snapshot moves from the prompt to the last token fed (the decode feeds every written token but
     // the last), so prompt + what was written continues it with one token to read instead of all it wrote.
-    // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
+    // Text only (`text`: the request had no pictures - the multi path's cur_img_* are the last GEN's, not its own),
+    // and only when the state stands exactly there (the decode paths leave pos = fed tokens).
     const auto pause_snapshot = [&](const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted,
-                                    bool keep) {
-        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr) {
+                                    bool keep, bool text) {
+        if (model.fast() && text && !emitted.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr) {
             const int64_t p = model.position();
             const int64_t full = (int64_t) (prompt.size() + emitted.size());
             if (keep && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {
@@ -2107,7 +2109,7 @@ static int glm_pack_generate(const Options& o) {
             if (p > (int64_t) prompt.size() && p < full && model.snapshot_save()) {
                 snap_tokens.assign(prompt.begin(), prompt.end());
                 snap_tokens.insert(snap_tokens.end(), emitted.begin(), emitted.begin() + (p - (int64_t) prompt.size()));
-                snap_img_hash = img_hash(snap_tokens.size());
+                snap_img_hash = kNoImages;
                 snap_in_slot = false;
                 std::fprintf(stderr, "glm slots: paused at %lld tokens (%lld written): the state is kept there\n",
                              (long long) p, (long long) emitted.size());
@@ -2367,7 +2369,7 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
-        if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load(), cur_img_pos.empty());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -2494,6 +2496,7 @@ static int glm_pack_generate(const Options& o) {
         int32_t pending = -1;    // written, not fed yet
         bool ready = false;      // just admitted: the first sample's logits are on the tail
         bool inflight = false, done = false, pause = false, keep = false;
+        bool images = false;     // its prompt had pictures
         const char* finish = "length";
         size_t reuse = 0;
         std::chrono::steady_clock::time_point t0, t1;
@@ -2667,7 +2670,7 @@ static int glm_pack_generate(const Options& o) {
     const auto flush_pauses = [&] {
         for (const auto& d : deferred_pauses) {
             bind_ctx(d.ctx);
-            pause_snapshot(d.prompt, d.emitted, d.keep);
+            pause_snapshot(d.prompt, d.emitted, d.keep, d.text);
             ctxs[(size_t) d.ctx].busy = false;
         }
         deferred_pauses.clear();
@@ -2695,11 +2698,11 @@ static int glm_pack_generate(const Options& o) {
         bool deferred = false;
         if (g.pause && std::strcmp(g.finish, "cancel") == 0) {
             if (in_read_gap) {   // (another context's prompt is being read and stays bound: the snapshot after it)
-                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep});
+                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep, !g.images});
                 deferred = true;
             } else {
                 bind_ctx(g.ctx);
-                pause_snapshot(g.prompt, g.emitted, g.keep);
+                pause_snapshot(g.prompt, g.emitted, g.keep, !g.images);
             }
         }
         if (g.produced > 0)
@@ -2997,6 +3000,7 @@ static int glm_pack_generate(const Options& o) {
         gap_failed = false;
         bind_ctx(best);
         model.set_image_rows(cur_img_pos, cur_img_rows);
+        g->images = !cur_img_pos.empty();
         model.force_next(-1);
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
