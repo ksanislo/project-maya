@@ -7523,6 +7523,9 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || frun != run || hdr[0] < 0 || hdr[1] > g.n_layers ||
             hdr[0] >= hdr[1] || hdr[3] < 0 || hdr[3] > 2 * (g.n_layers + 1))
             return differs();
+        // STRATA_GLM_SLOT_ANY_SPLIT=0: only the split that wrote it, as v1.1.48 (an on/off comparison)
+        static const bool any_split = [] { const char* v = getenv("STRATA_GLM_SLOT_ANY_SPLIT"); return !v || std::atoi(v) != 0; }();
+        if (!any_split && (nh != parts.size() || hdr[0] != parts[h]->l0_ || hdr[1] != parts[h]->l1_)) return differs();
         std::vector<int> kls, dls;
         for (int il = hdr[0]; il < hdr[1]; ++il) (g.is_recr(il) ? kls : dls).push_back(il);
         if ((int) kls.size() != hdr[2]) return differs();
