@@ -1,9 +1,10 @@
 // src/kernels/cpu/native_rows_exact_test.cpp - the multi-token expert rows (iq_avx512 / iq_avx2) and the one-token
 // rows (iq_avx2's rows1, iq_avx512_one) against ggml-cpu's own single-token dot, BIT FOR BIT, for every format they
-// take and 1-11 tokens; then GLM's split-base rows with
+// take and 1-16 tokens (the AVX1 rows of iq_avx1.cpp on a CPU without AVX2); then GLM's split-base rows with
 // several tokens against the same rows one token at a time (what a verify window computes vs the token path).
 // Synthetic rows (random codes, small normal block scales), Q8_K activations from ggml's quantizer.  CPU only.
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
@@ -122,7 +123,7 @@ void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, i
     const std::vector<int> widths = type == GGML_TYPE_IQ1_M ? std::vector<int>{256, 512, 2048, 2304, 4096, 5120}
                                                          : std::vector<int>{2048, 4096};
     for (int n : widths)
-        for (int nt = 1; nt <= 11; ++nt) {
+        for (int nt = 1; nt <= 16; ++nt) {
             bad += compare(fn, type, n, 17, nt, rng);
             total += 17 * nt;
         }
@@ -269,12 +270,22 @@ int main() {
     std::mt19937 rng(20261013);
     const int types[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS,
                          GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M};
-    const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok();
-    std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no");
+    const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok(), avx1 = cpu::cpu_avx1_only();
+    std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s, AVX1 only %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no",
+                avx1 ? "yes" : "no");
+    void (*no_q5k)(bool) noexcept = [](bool) noexcept {};
     for (int t : types) {
         if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
         if (avx2 && cpu::iq256_rows1_supported(t)) check_kernel("avx2-1t", cpu::iq256_rows1, cpu::iq256_set_q5k_fused, t, rng);
+        if (avx1 && cpu::iq128_supported(t)) {
+            check_kernel("avx1", cpu::iq128_rows, no_q5k, t, rng);
+            int bad = 0;   // tiny (subnormal-range) activation scales and an odd row count
+            for (int shift : {-120, -128})
+                for (int nt = 1; nt <= 16; ++nt) bad += compare(cpu::iq128_rows, t, 4096, 13, nt, rng, shift);
+            std::printf("  avx1    %-8s %5d results at tiny scales, %d differ\n", ggml_type_name((ggml_type) t), 2 * 13 * 136, bad);
+            if (bad != 0) ++failures;
+        }
         if (cpu::iq512_one_supported(t)) check_kernel("avx512-1t", cpu::iq512_one_rows, cpu::iq512_set_q5k_fused, t, rng);
     }
     if (avx2) {

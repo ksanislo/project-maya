@@ -1340,7 +1340,7 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   if(STRATA_CPU_X86)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp src/kernels/cpu/iq_avx1.cpp
                                              src/kernels/cpu/iq_avx512_one.cpp)
   else()
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
@@ -1358,6 +1358,8 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma;-ffp-contract=off")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+    # (the AVX1 rows set their ISA per function: target("avx,sse4.2,ssse3"))
+    set_source_files_properties(src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     # the one-token IQ2_XXS rows: VBMI's multishift and BMI2's pdep (run only where cpu_avx512_ok() and BMI2 say so)
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vbmi;-mbmi2;-mf16c;-mfma;-ffp-contract=off")
