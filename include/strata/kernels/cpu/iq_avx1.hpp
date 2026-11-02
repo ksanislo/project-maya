@@ -1,5 +1,6 @@
 // include/strata/kernels/cpu/iq_avx1.hpp - multi-token expert rows for CPUs with AVX but no AVX2 (Sandy / Ivy Bridge):
-// IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS, Q5_K against Q8_K, each token bit-identical to ggml-cpu's AVX dot.
+// IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ1_S, Q2_K, IQ4_XS, Q5_K against Q8_K, each token bit-identical to
+// ggml-cpu's AVX dot.
 #pragma once
 
 #include <cstddef>

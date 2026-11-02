@@ -64,11 +64,11 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
                 std::memcpy(&w[o + 48 + 2 * j], &word, sizeof word);
             }
         } else {
-            std::memcpy(&w[o], &d, sizeof d);
+            std::memcpy(&w[o + (t == GGML_TYPE_Q2_K ? 80 : 0)], &d, sizeof d);   // (Q2_K: d, dmin after its codes)
         }
-        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K) {
+        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q2_K) {
             const ggml_fp16_t m = ggml_fp32_to_fp16(0.001f + 0.0005f * (float) (next() % 16));
-            std::memcpy(&w[o + sizeof d], &m, sizeof m);
+            std::memcpy(&w[o + (t == GGML_TYPE_Q2_K ? 82 : sizeof d)], &m, sizeof m);
         }
     }
     // Check final IQ1_M delta rounding with subnormal accumulators too; other ggml builds may contract differently.
@@ -169,8 +169,10 @@ RowsFn pick_rows1(int type) {
         std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
                              "not used\n", ggml_type_name((ggml_type) type));
     }
-    if (!cpu_avx2_ok() && cpu_avx1_only() && iq128_supported(type) && std::getenv("STRATA_NO_IQ128") == nullptr) {
-        init_once();   // (AVX without AVX2: the AVX1 rows at one token too, where they give ggml's bits)
+    // (AVX without AVX2: the AVX1 rows at one token too, where they give ggml's bits; Q2_K's are slower there)
+    if (!cpu_avx2_ok() && cpu_avx1_only() && iq128_supported(type) && type != GGML_TYPE_Q2_K &&
+        std::getenv("STRATA_NO_IQ128") == nullptr) {
+        init_once();
         return rows_match_ggml(iq128_rows, type, {1}, 306) ? iq128_rows : nullptr;
     }
     if (!iq256_rows1_supported(type)) return nullptr;
