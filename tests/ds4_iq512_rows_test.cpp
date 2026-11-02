@@ -38,11 +38,17 @@ namespace {
 
 const int kTypes512[] = {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_M};
 // (a CPU with AVX but no AVX2: the AVX1 rows' types, iq_avx1_kern.inc, which the lane must take)
-const int kTypesAvx1[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S};
+const int kTypesAvx1[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S,
+                          GGML_TYPE_IQ1_S, GGML_TYPE_Q2_K};
 bool cpu_avx1_only();
 std::vector<int> kTypes;
 
 void put_scale(int type, uint8_t* blk, uint16_t d) {   // (IQ1_M: the F16 in the top nibbles of its 4 scale words)
+    if (type == GGML_TYPE_Q2_K) {   // (d, dmin after the codes; dmin the same value)
+        std::memcpy(blk + 80, &d, 2);
+        std::memcpy(blk + 82, &d, 2);
+        return;
+    }
     if (type != GGML_TYPE_IQ1_M) {
         std::memcpy(blk, &d, 2);
         return;

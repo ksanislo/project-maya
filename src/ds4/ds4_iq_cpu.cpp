@@ -800,6 +800,12 @@ void own_rows(int type, const uint8_t* w, size_t rb, int n, const void* const* a
 
 // a block's F16 scale: the first field, or (IQ1_M) the top nibbles of its four scale words
 void put_scale(ggml_type t, uint8_t* blk, ggml_fp16_t d) {
+    if (t == GGML_TYPE_Q2_K) {   // (d, dmin after the codes: dmin a small normal value)
+        const ggml_fp16_t m = ggml_fp32_to_fp16(0.0015f);
+        std::memcpy(blk + 80, &d, sizeof d);
+        std::memcpy(blk + 82, &m, sizeof m);
+        return;
+    }
     if (t != GGML_TYPE_IQ1_M) {
         std::memcpy(blk, &d, sizeof d);
         return;
@@ -921,6 +927,7 @@ bool own(int type) {
         case GGML_TYPE_IQ1_S: k = 4; break;
         case GGML_TYPE_IQ2_XS: k = 5; break;
         case GGML_TYPE_IQ1_M: k = 6; break;
+        case GGML_TYPE_Q2_K: k = 7; break;   // (the AVX1 rows only)
         default: return false;
     }
     static int mode = -1;   // DS4_IQ_OWN: -1 measured, 0 never, 1 always
@@ -939,8 +946,8 @@ bool own(int type) {
     }();
     if (isa().avx1) {   // (AVX without AVX2: the AVX1 rows wherever they give ggml-cpu's bits, from one token)
         if (!allowed || !avx1::supported(type)) return false;
-        static std::once_flag once1[7];
-        static bool ok1[7];
+        static std::once_flag once1[8];
+        static bool ok1[8];
         std::call_once(once1[k], [&] {
             ok1[k] = own_check(type);
             std::fprintf(stderr, "ds4: CPU lane %s rows: %s\n", ggml_type_name((ggml_type) type),
@@ -1038,6 +1045,7 @@ std::atomic<bool> g_iq1_on{true};
 // without pdep (iq1_no_pdep): then ours for every call, ggml-cpu's dot taking pdep's microcode on such a CPU
 bool own_nt(int type, int nt) {
     if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
+    if (type == GGML_TYPE_Q2_K && nt < 2) return false;   // (the AVX1 rows: slower than ggml's dot at one token)
 #if defined(IQ_X86)
     if (!own(type)) return false;
     return !x512_type(type) || nt >= x512_from(type);   // (IQ1_M on Zen 4: from 2 tokens)

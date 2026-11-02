@@ -671,6 +671,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(ds4_lane_bench tests/ds4_lane_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
     target_include_directories(ds4_lane_bench PRIVATE third_party/ggml)
     target_link_libraries(ds4_lane_bench PRIVATE strata_kernels_cpu)
+    # a GGUF layer's real experts on the CPU lane: us an expert at 1-8 tokens (glm_cpu_bench for ds4, no GPU)
+    add_executable(ds4_gguf_expert_bench tests/ds4_gguf_expert_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_gguf_expert_bench PRIVATE third_party/ggml)
+    target_link_libraries(ds4_gguf_expert_bench PRIVATE strata_kernels_cpu)
     # the CPU lane's exact AVX-512 rows without VBMI (src/ds4/ds4_iq512_kern.inc: IQ2_XS, IQ3_XXS, IQ1_M) bit for bit
     # against ggml-cpu's dot, one thread, no GPU: forced on (any CPU with AVX-512 F/BW/VL/DQ and BMI2), and this CPU's
     # default choice; --bench times the rows

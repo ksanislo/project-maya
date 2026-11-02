@@ -48,11 +48,11 @@ std::vector<uint8_t> rand_rows(int type, int n, int rows, std::mt19937& rng) {
                 std::memcpy(&w[o + 48 + 2 * j], &word, sizeof word);
             }
         } else {
-            std::memcpy(&w[o], &d, sizeof d);
+            std::memcpy(&w[o + (t == GGML_TYPE_Q2_K ? 80 : 0)], &d, sizeof d);   // (Q2_K: d, dmin after its codes)
         }
-        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K) {
+        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q2_K) {
             const ggml_fp16_t m = ggml_fp32_to_fp16(ds(rng));
-            std::memcpy(&w[o + sizeof d], &m, sizeof m);
+            std::memcpy(&w[o + (t == GGML_TYPE_Q2_K ? 82 : sizeof d)], &m, sizeof m);
         }
     }
     return w;
@@ -224,6 +224,78 @@ void check_iq1m_row_bounds(std::mt19937& rng) {
     }
 }
 
+// The int16 bounds of the AVX1 IQ1_S / Q2_K rows (their scales folded into the codes, sums in int16 before the int32
+// lanes): every scale and code at its largest, every activation code -128 or 127, against ggml's dot
+void check_avx1_worst_case() {
+    int bad = 0, total = 0;
+    for (int type : {GGML_TYPE_IQ1_S, GGML_TYPE_Q2_K}) {
+        const int n = 2048, nt = 5;
+        const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type);
+        const size_t ab = ggml_row_size(GGML_TYPE_Q8_K, n), qb = ggml_type_size(GGML_TYPE_Q8_K);
+        std::vector<uint8_t> w(rb * 2);
+        int gi = -1;   // (IQ1_S: a grid entry of eight +1 or eight -1)
+        for (int g = 0; type == GGML_TYPE_IQ1_S && g < 2048 && gi < 0; ++g) {
+            float v[256];
+            std::vector<uint8_t> b(bb, 0);
+            const ggml_fp16_t one = ggml_fp32_to_fp16(1.0f);
+            std::memcpy(b.data(), &one, 2);
+            b[2] = (uint8_t) g;
+            const uint16_t qh = (uint16_t) ((g >> 8) | 0x7000);
+            std::memcpy(b.data() + 34, &qh, 2);
+            ggml_get_type_traits((ggml_type) type)->to_float(b.data(), v, 256);
+            bool same = true;   // (values minus the delta: ls (+-1 - 0.125))
+            for (int k = 1; k < 8; ++k) same = same && v[k] == v[0];
+            if (same && std::fabs(v[0]) > 1.0f) gi = g;
+        }
+        for (int r = 0; r < 2; ++r)
+            for (size_t o = r * rb; o < (r + 1) * rb; o += bb) {
+                const ggml_fp16_t d = ggml_fp32_to_fp16(r ? -0.75f : 1.0f);
+                if (type == GGML_TYPE_IQ1_S) {
+                    std::memcpy(&w[o], &d, 2);
+                    for (int k = 0; k < 32; ++k) w[o + 2 + k] = (uint8_t) gi;
+                    const uint16_t qh = (uint16_t) ((gi >> 8) * 0x249 | 0x7000 | (r ? 0x8000 : 0));
+                    for (int k = 0; k < 8; ++k) std::memcpy(&w[o + 34 + 2 * k], &qh, 2);
+                } else {
+                    std::memset(&w[o], 0xff, 80);
+                    std::memcpy(&w[o + 80], &d, 2);
+                    std::memcpy(&w[o + 82], &d, 2);
+                }
+            }
+        std::vector<uint8_t> a(ab * nt, 0);
+        for (int t = 0; t < nt; ++t)
+            for (size_t o = ab * t; o < ab * (t + 1); o += qb) {
+                const int8_t v = t % 2 ? 127 : -128;
+                const float d = 0.01f;
+                std::memcpy(&a[o], &d, 4);
+                std::memset(&a[o + 4], (uint8_t) v, 256);
+                for (int k = 0; k < 16; ++k) {
+                    const int16_t bs = (int16_t) (16 * v);
+                    std::memcpy(&a[o + 260 + 2 * k], &bs, 2);
+                }
+            }
+        std::vector<const void*> ap(nt);
+        std::vector<float> got((size_t) nt * 2), ref((size_t) nt * 2);
+        std::vector<float*> op(nt);
+        for (int t = 0; t < nt; ++t) {
+            ap[t] = a.data() + ab * t;
+            op[t] = got.data() + 2 * t;
+            for (int r = 0; r < 2; ++r)
+                ggml_get_type_traits_cpu((ggml_type) type)->vec_dot(n, &ref[2 * t + r], 0, w.data() + r * rb, 0, ap[t], 0, 1);
+        }
+        for (int k : {1, 2, 5}) {
+            std::fill(got.begin(), got.end(), 0.0f);
+            cpu::iq128_rows(type, w.data(), rb, n, ap.data(), k, op.data(), 0, 2);
+            bad += std::memcmp(got.data(), ref.data(), (size_t) 2 * k * sizeof(float)) != 0;
+            ++total;
+        }
+        std::printf("  avx1    %-8s int16 worst case (ggml %.6g): %s\n", ggml_type_name((ggml_type) type), ref[0],
+                    type == GGML_TYPE_IQ1_S && gi < 0 ? "no all-equal grid entry" : "checked");
+        if (type == GGML_TYPE_IQ1_S && gi < 0) ++bad;
+    }
+    std::printf("  avx1 int16 worst cases: %d runs, %d differ from ggml\n", total, bad);
+    if (bad != 0) ++failures;
+}
+
 // GLM's split rows: nt tokens at once vs each token alone (the token path), bit for bit, swiglu clamp 10
 void check_split(int type, std::mt19937& rng) {
     cpu::NativeFmt f;
@@ -274,7 +346,10 @@ int main() {
     std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s, AVX1 only %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no",
                 avx1 ? "yes" : "no");
     void (*no_q5k)(bool) noexcept = [](bool) noexcept {};
-    for (int t : types) {
+    std::vector<int> all(std::begin(types), std::end(types));
+    for (int t : {GGML_TYPE_IQ1_S, GGML_TYPE_Q2_K})   // (the AVX1 rows only)
+        if (avx1) all.push_back(t);
+    for (int t : all) {
         if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
         if (avx2 && cpu::iq256_rows1_supported(t)) check_kernel("avx2-1t", cpu::iq256_rows1, cpu::iq256_set_q5k_fused, t, rng);
@@ -288,12 +363,13 @@ int main() {
         }
         if (cpu::iq512_one_supported(t)) check_kernel("avx512-1t", cpu::iq512_one_rows, cpu::iq512_set_q5k_fused, t, rng);
     }
+    if (avx1) check_avx1_worst_case();
     if (avx2) {
         check_iq1m_tiny_activations();
         check_iq1m_worst_case();
         check_iq1m_row_bounds(rng);
     }
-    for (int t : types) check_split(t, rng);
+    for (int t : all) check_split(t, rng);
     if (failures != 0) {
         std::printf("native_rows_exact_test: %d FAILED\n", failures);
         return 1;
