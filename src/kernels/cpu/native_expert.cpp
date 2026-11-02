@@ -6,6 +6,7 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -112,6 +114,8 @@ RowsFn pick_rows(int type) {
     // full clock); on a Skylake-SP Xeon 6152 the AVX-2 rows were 7-13% faster (glm_cpu_bench, Maya-L, 2-16 tokens)
     const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    // AVX without AVX2 (Sandy / Ivy Bridge): the 128-bit rows of iq_avx1.cpp; STRATA_NO_IQ128 keeps ggml's dots
+    const bool avx1 = !avx2 && cpu_avx1_only() && std::getenv("STRATA_NO_IQ128") == nullptr;
     RowsFn fn = nullptr;
     void (*set_q5k)(bool) noexcept = nullptr;
     if (avx512 && iq512_supported(type)) {
@@ -120,10 +124,12 @@ RowsFn pick_rows(int type) {
     } else if (avx2 && iq256_supported(type)) {
         fn = iq256_rows;
         set_q5k = iq256_set_q5k_fused;
+    } else if (avx1 && iq128_supported(type)) {
+        fn = iq128_rows;   // (no FMA: ggml's Q5_K min term is a plain mul and add, no second form)
     }
     if (fn == nullptr) return nullptr;
     if (rows_match_ggml(fn, type)) return fn;
-    if (type == GGML_TYPE_Q5_K) {   // a ggml-cpu built without contraction (MSVC): its min term unfused
+    if (type == GGML_TYPE_Q5_K && set_q5k != nullptr) {   // a ggml-cpu built without contraction (MSVC): its min term unfused
         set_q5k(false);
         if (rows_match_ggml(fn, type)) return fn;
         set_q5k(true);
@@ -162,6 +168,10 @@ RowsFn pick_rows1(int type) {
         if (rows_match_ggml(iq512_one_rows, type, {1}, 306)) return iq512_one_rows;
         std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
                              "not used\n", ggml_type_name((ggml_type) type));
+    }
+    if (!cpu_avx2_ok() && cpu_avx1_only() && iq128_supported(type) && std::getenv("STRATA_NO_IQ128") == nullptr) {
+        init_once();   // (AVX without AVX2: the AVX1 rows at one token too, where they give ggml's bits)
+        return rows_match_ggml(iq128_rows, type, {1}, 306) ? iq128_rows : nullptr;
     }
     if (!iq256_rows1_supported(type)) return nullptr;
     init_once();
@@ -250,7 +260,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;   // pre-AVX2: ggml's vec_dot
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;   // pre-AVX2: the AVX1 rows
     if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -260,6 +270,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
+    }
+    if (nt >= 2 && !avx512 && !avx2 && exact_rows(f.gu_type) != nullptr) {   // the AVX1 rows (pick_rows)
+        native_gu_rows_split(f, blob, blob + f.up_off, act, nt, ff, r0, r1, std::numeric_limits<float>::infinity());
+        return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
@@ -360,6 +374,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
 #endif
     if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (nt >= 2 && !cpu_avx2_ok() && exact_rows(f.d_type) != nullptr) {   // the AVX1 rows (pick_rows)
+        native_down_rows_split(f, blob + f.down_off, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

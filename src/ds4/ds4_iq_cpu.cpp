@@ -69,7 +69,7 @@ kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookup
 // x512: AVX-512 F / BW / VL / DQ with BMI2 (no VBMI: Skylake-SP Xeons too), pop512: and VPOPCNTDQ
 struct IqCpuIsa {
     bool avx2 = false, w512 = false, bmi2 = false, x512 = false, pop512 = false;
-    bool avx1 = false;   // AVX (the OS saving the YMM state) without AVX2 + FMA: the AVX1 rows (ds4_iq128_kern.inc)
+    bool avx1 = false;   // AVX (the OS saving the YMM state) without AVX2 + FMA: the AVX1 rows (iq_avx1_kern.inc)
 };
 IqCpuIsa iq_isa() {
     IqCpuIsa c;
@@ -776,7 +776,7 @@ void iq1s_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int
     }
 }
 
-#include "ds4_iq128_kern.inc"
+#include "strata/kernels/cpu/iq_avx1_kern.inc"
 #endif  // IQ_X86
 
 // out[t][r - r0] for the rows of `type` (an own type only)

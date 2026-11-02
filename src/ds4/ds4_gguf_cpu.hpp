@@ -73,7 +73,7 @@ bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI, IQ2_XS / IQ1_M on AVX-512
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512; IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S on AVX without AVX2 -
-/// ds4_iq128_kern.inc: ggml-cpu's numbers bit for bit, checked against its dot on first use;
+/// iq_avx1_kern.inc: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
 /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where

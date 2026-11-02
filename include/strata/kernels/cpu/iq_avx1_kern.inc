@@ -1,9 +1,12 @@
-// src/ds4/ds4_iq128_kern.inc - the CPU lane's i-quant rows for CPUs with AVX but no AVX2 (Sandy / Ivy Bridge, Xeon E5
-// v1 / v2), included by ds4_iq_cpu.cpp.  Without them such a CPU runs ggml-cpu's one-token AVX dots for every expert.
+// include/strata/kernels/cpu/iq_avx1_kern.inc - expert rows for CPUs with AVX but no AVX2 (Sandy / Ivy Bridge, Xeon E5
+// v1 / v2), included by ds4_iq_cpu.cpp (DeepSeek's CPU lane) and iq_avx1.cpp (GLM's native rows); the includer brings
+// <immintrin.h>, <cstring> and ggml-common.h (GGML_COMMON_IMPL_CPP).  Without them such a CPU runs ggml-cpu's one-token
+// AVX dots for every expert.
 // Each 32-value chunk is decoded once a pass and applied to up to 4 tokens in 128-bit integer lanes (pshufb, sign_epi8,
 // maddubs, madd: SSSE3 / SSE2), the two 16-value halves being the lanes of ggml's AVX dot; the float steps are ggml's
 // AVX order (256-bit mul then add, no FMA, then K * hsum_float_8), so a token's dot is ggml-cpu's bit for bit at any
-// token count: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  Checked against ggml's dot (own()).
+// token count: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), and (GLM's down rows) Q5_K (13) and
+// IQ4_XS (23).  The includers check them against ggml's dot before use.
 #define IQ_AVX1 __attribute__((target("avx,sse4.2,ssse3")))
 
 namespace avx1 {
@@ -13,10 +16,31 @@ inline uint16_t u16(const uint8_t* p) {
     std::memcpy(&v, p, 2);
     return v;
 }
+inline uint32_t u32(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return v;
+}
 inline uint64_t u64(const uint8_t* p) {
     uint64_t v;
     std::memcpy(&v, p, 8);
     return v;
+}
+inline float h2f(uint16_t h) {   // F16 -> F32, exactly (no F16C needed)
+    const uint32_t s = (uint32_t) (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    uint32_t b;
+    if (e == 0) {
+        const float f = (float) m * 5.9604644775390625e-8f;
+        std::memcpy(&b, &f, 4);
+        b |= s;
+    } else if (e == 31) {
+        b = s | 0x7f800000u | (m << 13);
+    } else {
+        b = s | ((e + 112u) << 23) | (m << 13);
+    }
+    float f;
+    std::memcpy(&f, &b, 4);
+    return f;
 }
 
 // 16 sign bytes (-1 / +1) from two sign bytes of w (byte_pair 0: bytes 0-1, 1: bytes 2-3)
@@ -193,13 +217,125 @@ IQ_AVX1 inline void row_dot(const uint8_t* row, int nb, const block_q8_K* const*
     }
 }
 
+IQ_AVX1 inline float hsum8(__m256 a) {   // ggml's hsum_float_8
+    __m128 s = _mm_add_ps(_mm256_extractf128_ps(a, 1), _mm256_castps256_ps128(a));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+// Q5_K (176-byte blocks: d, dmin, 12 scale bytes, 32 high-bit bytes, 128 nibble bytes): ggml's AVX dot, the 32-value
+// sub-blocks decoded once for all tokens; the min term per token as ggml's scalar sum
+template <int NT>
+IQ_AVX1 inline void q5k_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
+    const __m128i m4 = _mm_set1_epi8(0xF);
+    __m256 accf[NT];
+    float summs[NT];
+    for (int t = 0; t < NT; ++t) {
+        accf[t] = _mm256_setzero_ps();
+        summs[t] = 0.f;
+    }
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = row + (size_t) i * 176;
+        _mm_prefetch((const char*) blk + 2048, _MM_HINT_T0);
+        _mm_prefetch((const char*) blk + 2048 + 64, _MM_HINT_T0);
+        _mm_prefetch((const char*) blk + 2048 + 128, _MM_HINT_T0);
+        uint32_t utmp[4];
+        std::memcpy(utmp, blk + 4, 12);
+        utmp[3] = ((utmp[2] >> 4) & 0x0f0f0f0f) | (((utmp[1] >> 6) & 0x03030303) << 4);
+        const uint32_t uaux = utmp[1] & 0x3f3f3f3f;
+        utmp[1] = (utmp[2] & 0x0f0f0f0f) | (((utmp[0] >> 6) & 0x03030303) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= 0x3f3f3f3f;
+        const uint8_t* sc = (const uint8_t*) utmp;   // bytes 0-7 the scales, 8-15 the mins
+        const __m128i mins = _mm_cvtepu8_epi16(_mm_set_epi32(0, 0, (int) utmp[3], (int) utmp[2]));
+        const float xd = h2f(u16(blk)), xm = h2f(u16(blk + 2));
+        for (int t = 0; t < NT; ++t) {
+            const __m128i q8s = _mm_hadd_epi16(_mm_loadu_si128((const __m128i*) &y[t][i].bsums[0]),
+                                               _mm_loadu_si128((const __m128i*) &y[t][i].bsums[8]));
+            const __m128i prod = _mm_madd_epi16(mins, q8s);
+            const __m128i hs = _mm_hadd_epi32(_mm_hadd_epi32(prod, _mm_setzero_si128()), _mm_setzero_si128());
+            summs[t] += (-y[t][i].d * xm) * _mm_extract_epi32(hs, 0);
+        }
+        const __m128i hb0 = _mm_loadu_si128((const __m128i*) (blk + 16));
+        const __m128i hb1 = _mm_loadu_si128((const __m128i*) (blk + 32));
+        __m128i acci[NT][2];
+        for (int t = 0; t < NT; ++t) acci[t][0] = acci[t][1] = _mm_setzero_si128();
+        for (int s = 0; s < 8; ++s) {
+            const __m128i b0 = _mm_loadu_si128((const __m128i*) (blk + 48 + 32 * (s >> 1)));
+            const __m128i b1 = _mm_loadu_si128((const __m128i*) (blk + 48 + 32 * (s >> 1) + 16));
+            const __m128i hm = _mm_set1_epi8((char) (1 << s));
+            const __m128i l0 = (s & 1) ? _mm_and_si128(_mm_srli_epi16(b0, 4), m4) : _mm_and_si128(b0, m4);
+            const __m128i l1 = (s & 1) ? _mm_and_si128(_mm_srli_epi16(b1, 4), m4) : _mm_and_si128(b1, m4);
+            const __m128i q0 = _mm_add_epi8(l0, _mm_slli_epi16(_mm_srli_epi16(_mm_and_si128(hb0, hm), s), 4));
+            const __m128i q1 = _mm_add_epi8(l1, _mm_slli_epi16(_mm_srli_epi16(_mm_and_si128(hb1, hm), s), 4));
+            const __m128i scv = _mm_set1_epi16((short) sc[s]);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* q8 = y[t][i].qs + 32 * s;
+                acci[t][0] = _mm_add_epi32(acci[t][0], _mm_madd_epi16(scv, _mm_maddubs_epi16(q0, _mm_loadu_si128((const __m128i*) q8))));
+                acci[t][1] = _mm_add_epi32(acci[t][1], _mm_madd_epi16(scv, _mm_maddubs_epi16(q1, _mm_loadu_si128((const __m128i*) (q8 + 16)))));
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            const __m256 f = _mm256_cvtepi32_ps(_mm256_insertf128_si256(_mm256_castsi128_si256(acci[t][0]), acci[t][1], 1));
+            accf[t] = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(y[t][i].d * xd), f), accf[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]) + summs[t];
+}
+
+// IQ4_XS (136-byte blocks: d, scales_h, 4 scales_l, 128 nibble bytes): ggml's AVX dot, |w| and the table lookup once
+template <int NT>
+IQ_AVX1 inline void iq4xs_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
+    const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = row + (size_t) i * 136;
+        _mm_prefetch((const char*) blk + 2048, _MM_HINT_T0);
+        _mm_prefetch((const char*) blk + 2048 + 64, _MM_HINT_T0);
+        const uint16_t sh = u16(blk + 2);
+        __m128i acci[NT][2];
+        for (int t = 0; t < NT; ++t) acci[t][0] = acci[t][1] = _mm_setzero_si128();
+        for (int ib = 0; ib < 8; ++ib) {
+            const __m128i qb = _mm_loadu_si128((const __m128i*) (blk + 8 + 16 * ib));
+            const __m128i w0 = _mm_shuffle_epi8(values, _mm_and_si128(qb, m4));
+            const __m128i w1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(qb, 4), m4));
+            const __m128i a0 = _mm_sign_epi8(w0, w0), a1 = _mm_sign_epi8(w1, w1);
+            const int ls = (((blk[4 + ib / 2] >> (4 * (ib & 1))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4)) - 32;
+            const __m128i lsv = _mm_set1_epi16((short) ls);
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* q8 = y[t][i].qs + 32 * ib;
+                const __m128i p0 = _mm_maddubs_epi16(a0, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) q8), w0));
+                const __m128i p1 = _mm_maddubs_epi16(a1, _mm_sign_epi8(_mm_loadu_si128((const __m128i*) (q8 + 16)), w1));
+                acci[t][0] = _mm_add_epi32(acci[t][0], _mm_madd_epi16(p0, lsv));
+                acci[t][1] = _mm_add_epi32(acci[t][1], _mm_madd_epi16(p1, lsv));
+            }
+        }
+        const float xd = h2f(u16(blk));
+        for (int t = 0; t < NT; ++t) {
+            const __m256 f = _mm256_cvtepi32_ps(_mm256_insertf128_si256(_mm256_castsi128_si256(acci[t][0]), acci[t][1], 1));
+            accf[t] = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(xd * y[t][i].d), f), accf[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
+}
+
+template <int TY, int NT>
+IQ_AVX1 inline void any_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
+    if constexpr (TY == 13) q5k_dot<NT>(row, nb, y, res);
+    else if constexpr (TY == 23) iq4xs_dot<NT>(row, nb, y, res);
+    else row_dot<TY, NT>(row, nb, y, res);
+}
+
 template <int TY, int NT>
 IQ_AVX1 void rows_nt(const uint8_t* w, size_t rb, int nb, const void* const* act, float* const* out, int r0, int r1) {
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(w + (size_t) r * rb, nb, y, res);
+        any_dot<TY, NT>(w + (size_t) r * rb, nb, y, res);
         for (int t = 0; t < NT; ++t) out[t][r - r0] = res[t];
     }
 }
@@ -217,16 +353,19 @@ void rows_t(const uint8_t* w, size_t rb, int n, const void* const* act, int nt, 
     }
 }
 
-bool supported(int type) { return type == 16 || type == 17 || type == 18 || type == 21 || type == 22; }
+inline bool supported(int type) { return type == 16 || type == 17 || type == 18 || type == 21 || type == 22; }
+inline bool supported_glm(int type) { return supported(type) || type == 13 || type == 23; }   // (+ GLM's down types)
 
 // out[t][r - r0], as own_rows
-void rows(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+inline void rows(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     switch (type) {
         case 16: rows_t<16>(w, rb, n, act, nt, out, r0, r1); break;
         case 17: rows_t<17>(w, rb, n, act, nt, out, r0, r1); break;
         case 18: rows_t<18>(w, rb, n, act, nt, out, r0, r1); break;
         case 21: rows_t<21>(w, rb, n, act, nt, out, r0, r1); break;
         case 22: rows_t<22>(w, rb, n, act, nt, out, r0, r1); break;
+        case 13: rows_t<13>(w, rb, n, act, nt, out, r0, r1); break;
+        case 23: rows_t<23>(w, rb, n, act, nt, out, r0, r1); break;
         default: break;
     }
 }

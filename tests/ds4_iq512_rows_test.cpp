@@ -3,7 +3,7 @@
 // (iq_cpu_rows, iq_cpu_gate_up): random blocks at the experts' widths and others, 1 to 16 tokens a call, whole
 // matrices and row ranges that start mid-way (the rows outside untouched), block scales at their edges (zero, -0,
 // subnormal, the largest F16) and activations scaled down until the sums are subnormal (IQ1_M's last FMA).  One
-// thread, no GPU.  On a CPU with AVX but no AVX2 it checks the AVX1 rows' types instead (ds4_iq128_kern.inc), which
+// thread, no GPU.  On a CPU with AVX but no AVX2 it checks the AVX1 rows' types instead (iq_avx1_kern.inc), which
 // the lane must take there.
 //
 //   DS4_IQ512=1 ds4_iq512_rows_test       the rows forced on: on a CPU with AVX-512 F / BW / VL / DQ and BMI2 the
@@ -37,7 +37,7 @@ namespace gg = strata::ds4::gguf;
 namespace {
 
 const int kTypes512[] = {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_M};
-// (a CPU with AVX but no AVX2: the AVX1 rows' types, ds4_iq128_kern.inc, which the lane must take)
+// (a CPU with AVX but no AVX2: the AVX1 rows' types, iq_avx1_kern.inc, which the lane must take)
 const int kTypesAvx1[] = {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S};
 bool cpu_avx1_only();
 std::vector<int> kTypes;
