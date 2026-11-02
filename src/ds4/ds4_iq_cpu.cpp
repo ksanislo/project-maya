@@ -69,6 +69,7 @@ kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookup
 // x512: AVX-512 F / BW / VL / DQ with BMI2 (no VBMI: Skylake-SP Xeons too), pop512: and VPOPCNTDQ
 struct IqCpuIsa {
     bool avx2 = false, w512 = false, bmi2 = false, x512 = false, pop512 = false;
+    bool avx1 = false;   // AVX (the OS saving the YMM state) without AVX2 + FMA: the AVX1 rows (iq_avx1_kern.inc)
 };
 IqCpuIsa iq_isa() {
     IqCpuIsa c;
@@ -86,7 +87,8 @@ IqCpuIsa iq_isa() {
     cpuid(0, 0);
     if (r[0] < 7) return c;
     cpuid(1, 0);
-    if (!((r[2] >> 12) & 1u) || !((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return c;   // FMA, OSXSAVE, AVX
+    if (!((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return c;   // OSXSAVE, AVX
+    const bool fma = (r[2] >> 12) & 1u;
 #if defined(_MSC_VER)
     const unsigned long long xcr0 = _xgetbv(0);
 #else
@@ -96,7 +98,9 @@ IqCpuIsa iq_isa() {
 #endif
     if ((xcr0 & 0x6) != 0x6) return c;
     cpuid(7, 0);
-    c.avx2 = (r[1] >> 5) & 1u;
+    c.avx2 = fma && ((r[1] >> 5) & 1u);
+    c.avx1 = !c.avx2;
+    if (!fma) return c;
     c.bmi2 = (r[1] >> 8) & 1u;
     c.w512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 30) & 1u) && ((r[2] >> 1) & 1u) &&
              ((r[1] >> 8) & 1u);   // AVX-512 F, BW, VBMI; BMI2
@@ -771,12 +775,15 @@ void iq1s_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int
         }
     }
 }
+
+#include "strata/kernels/cpu/iq_avx1_kern.inc"
 #endif  // IQ_X86
 
 // out[t][r - r0] for the rows of `type` (an own type only)
 void own_rows(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0,
               int r1) {
 #if defined(IQ_X86)
+    if (isa().avx1) return avx1::rows(type, w, rb, n, act, nt, out, r0, r1);
     if (type == GGML_TYPE_IQ2_XXS) return iq_rows_n<16>(w, rb, n, act, nt, out, r0, r1);
     if (type == GGML_TYPE_IQ2_S) return iq_rows_n<22>(w, rb, n, act, nt, out, r0, r1);
     if (type == GGML_TYPE_IQ3_XXS) {
@@ -928,8 +935,19 @@ bool own(int type) {
         g_codes_ok = build_codes3();   // (the 512-bit rows' tables; without them those rows are not used)
         build_ks64();
         build_ct2x();
-        return mode != 0 && isa().avx2;
+        return mode != 0 && (isa().avx2 || isa().avx1);
     }();
+    if (isa().avx1) {   // (AVX without AVX2: the AVX1 rows wherever they give ggml-cpu's bits, from one token)
+        if (!allowed || !avx1::supported(type)) return false;
+        static std::once_flag once1[7];
+        static bool ok1[7];
+        std::call_once(once1[k], [&] {
+            ok1[k] = own_check(type);
+            std::fprintf(stderr, "ds4: CPU lane %s rows: %s\n", ggml_type_name((ggml_type) type),
+                         ok1[k] ? "AVX1 (bit-identical to ggml-cpu's dot)" : "ggml-cpu's (the AVX1 rows differ from its dot here)");
+        });
+        return ok1[k];
+    }
     // (IQ2 on an AVX-512 CPU: the GLM lane's AVX-512 rows serve them, unless DS4_IQ_AVX2; IQ1_S has no such rows)
     if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2) || (k >= 5 && x512_from(type) == 0)) return false;
     static std::once_flag once[7];
