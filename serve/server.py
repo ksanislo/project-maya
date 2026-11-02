@@ -368,6 +368,24 @@ def fair_slice_seconds() -> float:
         return 0.0
 
 
+def fair_read_seconds() -> float:
+    """STRATA_FAIR_READ_S: a prompt read this long while another request waits behind it (sent to the engine, nothing
+    heard from it yet) pauses at the engine's next chunk - the engine keeps what it read - and goes on with the rest
+    once that request has started (0, the default: a prompt is read to the end).  The design is upstream PR #144's."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_FAIR_READ_S", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def fair_read_yield_seconds() -> float:
+    """STRATA_FAIR_READ_YIELD_S: how long a paused prompt holds back at most for the requests it paused for (30)."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_FAIR_READ_YIELD_S", "30") or 0))
+    except ValueError:
+        return 30.0
+
+
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
@@ -855,6 +873,7 @@ class StrataEngine:
         self._routes_lock = threading.Lock()
         self._rids = itertools.count(1)
         self._tls = threading.local()                   # the request this thread is generating (pause())
+        self._sent: dict[int, list] = {}                # rid -> [sent at, heard anything] (fair reads: who waits)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
@@ -1071,7 +1090,7 @@ class StrataEngine:
         # it waited for its own lines for ever, holding its place in the FIFO (four of those under --parallel and no
         # request starts any more, the queue filling with requests nothing ever takes: the engine restart was the
         # trigger, the silent wait the bug).
-        rids, routes, routes_lock = self._rids, self._routes, self._routes_lock
+        rids, routes, routes_lock, sent = self._rids, self._routes, self._routes_lock, self._sent
         ctx = self.max_context
         self.ended = False
         try:
@@ -1082,9 +1101,9 @@ class StrataEngine:
             #  stays what it was, the next request starts it again or says why it cannot)
             self.max_context = ctx
             self.info = {**info, **self.info}
-            self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
+            self._rids, self._routes, self._routes_lock, self._sent = rids, routes, routes_lock, sent
             raise
-        self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
+        self._rids, self._routes, self._routes_lock, self._sent = rids, routes, routes_lock, sent
         self.info = {**info, **self.info}
 
     @property
@@ -1462,7 +1481,9 @@ class StrataEngine:
         q: queue.Queue = queue.Queue()
         with self._routes_lock:
             self._routes[rid] = q
+            self._sent[rid] = [time.monotonic(), False]
         self._tls.rid = rid
+        self._tls.pp = None                 # this request's last prompt-progress report (fair reads)
         self.progress = None
         self.prefill_tok_s_mean = None
         self._tls.own_pp = None
@@ -1517,6 +1538,9 @@ class StrataEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()
                 stall.clear()
+                with self._routes_lock:
+                    if rid in self._sent:
+                        self._sent[rid][1] = True
                 f = line.split()
                 if lp_wait is not None and not line.startswith("LP "):
                     t, lp_wait = lp_wait, None
@@ -1537,6 +1561,7 @@ class StrataEngine:
                         self.progress = (int(f[2]), int(f[3]),
                                          int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
                                          float(f[4]) if len(f) >= 5 else 0.0)
+                        self._tls.pp = self.progress
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
                         if getattr(self, "_tls", None) is not None:
                             self._tls.own_pp = (self.progress, self.prefill_tok_s_mean)
@@ -1577,7 +1602,20 @@ class StrataEngine:
             with self._routes_lock:
                 if self._routes.get(rid) is q:                # (a restarted engine's table may hold another one)
                     del self._routes[rid]
+                self._sent.pop(rid, None)
             self._tls.rid = None
+
+    def waiting_behind(self, seconds: float) -> set:
+        """Several conversations: the other requests sent this long ago that have heard nothing yet (no token, no read
+        progress) - they wait behind this thread's prompt read."""
+        me, now = getattr(self._tls, "rid", None), time.monotonic()
+        with self._routes_lock:
+            return {r for r, (t, h) in self._sent.items() if r != me and not h and now - t >= seconds}
+
+    def started(self, rids) -> bool:
+        """Those requests have heard from the engine (their read began) or are gone."""
+        with self._routes_lock:
+            return all(r not in self._sent or self._sent[r][1] for r in rids)
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -3631,6 +3669,7 @@ class Service:
         soft, think_end = (sampling or {}).get("_think_soft"), (sampling or {}).get("_think_end")
         soft_text = self._guard_piece() if isinstance(soft, int) and isinstance(think_end, int) else None
         tail_text = ""
+        read_s = fair_read_seconds() if getattr(self.engine, "multi", 0) else 0.0
         while True:
             last0 = getattr(self.engine, "last", None)
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
@@ -3638,6 +3677,7 @@ class Service:
                 self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
+            t_read, paused_for = None, set()            # fair reads: the first chunk report's time, who it paused for
             try:
                 for t in gen:
                     if guard is None:
@@ -3645,6 +3685,21 @@ class Service:
                     elif t is None:
                         yield None
                     if t is None:
+                        # STRATA_FAIR_READ_S: this prompt read that long (from its first chunk report: a request
+                        # queued behind another's read never pauses its own), someone waiting behind it - PAUSE: the
+                        # engine stops at a chunk boundary and keeps what it read; the rest after they started
+                        pp = getattr(getattr(self.engine, "_tls", None), "pp", None)
+                        if pp and t_read is None:
+                            t_read = time.monotonic()
+                        if read_s > 0 and t0 is None and not pausing and not emb and not self.stopping and pp \
+                                and pp[0] < pp[1] and time.monotonic() - t_read >= read_s \
+                                and getattr(self.engine, "can_pause", False):
+                            paused_for = self.engine.waiting_behind(2.0)
+                            if paused_for:
+                                self.engine.pause()
+                                pausing = True
+                                print(f"[maya] fair read: {pp[0]:,} of {pp[1]:,} prompt tokens read, paused for "
+                                      f"{len(paused_for)} waiting request(s); the rest after they started", flush=True)
                         continue
                     produced.append(t)
                     if soft_text is not None:
@@ -3748,6 +3803,12 @@ class Service:
                 self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "tool", "tail",
                                                          "max_tokens") if k in mine},
                                    generated=len(produced))
+            if paused_for:   # a paused read: back once the requests it paused for have started (else the engine
+                until = time.monotonic() + fair_read_yield_seconds()   # takes it up at once, ahead of them)
+                while time.monotonic() < until and not self.stopping and not cancel.is_set() \
+                        and not self.engine.started(paused_for):
+                    yield None
+                    time.sleep(0.25)
             if self.stopping or cancel.is_set():
                 break
             if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
@@ -6069,7 +6130,8 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
-              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_FAIR_READ_S", "STRATA_FAIR_READ_YIELD_S",
+              "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
               "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
