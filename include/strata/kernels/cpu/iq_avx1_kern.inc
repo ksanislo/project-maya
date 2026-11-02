@@ -1,5 +1,5 @@
 // include/strata/kernels/cpu/iq_avx1_kern.inc - expert rows for CPUs with AVX but no AVX2 (Sandy / Ivy Bridge, Xeon E5
-// v1 / v2), included by ds4_iq_cpu.cpp (DeepSeek's CPU lane) and iq_avx1.cpp (GLM's native rows); the includer brings
+// v1 / v2), included by iq_avx1.cpp (GLM's native rows); the includer brings
 // <immintrin.h>, <cstring> and ggml-common.h (GGML_COMMON_IMPL_CPP).  Without them such a CPU runs ggml-cpu's one-token
 // AVX dots for every expert.
 // Each 32-value chunk is decoded once a pass and applied to up to 4 tokens in 128-bit integer lanes (pshufb, sign_epi8,
